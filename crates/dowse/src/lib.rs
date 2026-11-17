@@ -166,6 +166,16 @@ pub(crate) struct Fields {
     /// 非 CJK 输入即搜辅助字段：存索引期 edge-ngram 前缀，不落 STORED。
     pub name_prefixes: tantivy::schema::Field,
     pub content_prefixes: tantivy::schema::Field,
+    /// schema v8 문서 속성: 작성자/제목(본문과 같은 토크나이저, STORED)과 작성일/수정일
+    /// (UTC 밀리초, STORED + FAST). 속성이 없는 문서에는 값을 넣지 않는다.
+    pub author: tantivy::schema::Field,
+    pub title: tantivy::schema::Field,
+    pub doc_created: tantivy::schema::Field,
+    pub doc_modified: tantivy::schema::Field,
+    /// 작성자·제목의 입력 즉시 검색용 보조 필드(다중 값: title, author). 본문 쪽
+    /// `*_chars`/`*_prefixes`와 같은 토크나이저라 평범한 입력으로도 작성자 이름이 잡힌다.
+    pub props_chars: tantivy::schema::Field,
+    pub props_prefixes: tantivy::schema::Field,
 }
 
 /// 定义 schema：path/ext/kind 原样存（不分词），name/content 走 jieba 分词，
@@ -201,17 +211,23 @@ pub(crate) fn build_schema() -> (Schema, Fields) {
         path: builder.add_text_field("path", STRING | STORED),
         name: builder.add_text_field("name", jieba_text.clone()),
         ext: builder.add_text_field("ext", STRING | STORED),
-        content: builder.add_text_field("content", jieba_text),
+        content: builder.add_text_field("content", jieba_text.clone()),
         mtime: builder.add_i64_field("mtime", STORED | FAST),
         size: builder.add_u64_field("size", STORED | FAST),
         kind: builder.add_text_field("kind", STRING | STORED),
         path_text: builder.add_text_field("path_text", jieba_indexed_only),
         name_chars: builder.add_text_field("name_chars", cjk_chars_indexed_only.clone()),
-        content_chars: builder.add_text_field("content_chars", cjk_chars_indexed_only),
+        content_chars: builder.add_text_field("content_chars", cjk_chars_indexed_only.clone()),
         name_prefixes: builder
             .add_text_field("name_prefixes", autocomplete_prefix_indexed_only.clone()),
         content_prefixes: builder
-            .add_text_field("content_prefixes", autocomplete_prefix_indexed_only),
+            .add_text_field("content_prefixes", autocomplete_prefix_indexed_only.clone()),
+        author: builder.add_text_field("author", jieba_text.clone()),
+        title: builder.add_text_field("title", jieba_text),
+        doc_created: builder.add_i64_field("doc_created", STORED | FAST),
+        doc_modified: builder.add_i64_field("doc_modified", STORED | FAST),
+        props_chars: builder.add_text_field("props_chars", cjk_chars_indexed_only),
+        props_prefixes: builder.add_text_field("props_prefixes", autocomplete_prefix_indexed_only),
     };
     (builder.build(), fields)
 }

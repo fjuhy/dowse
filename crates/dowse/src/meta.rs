@@ -25,9 +25,13 @@ use crate::cursor::{UsnCursor, VolumeKey};
 /// 与 jieba 相关性分词拆开；旧索引没有这些 autocomplete 字段，必须重建。
 /// v7 主分词器把한글 run 交给 lindera ko-dic 做形态素切分（`배터리팩의` →
 /// `배터리`/`팩`/`의`），token 边界跟 v6 的整词切分不一样，旧索引必须重建。
+/// v8 新增文档属性字段：author/title（jieba 分词 + STORED）、doc_created/
+/// doc_modified（UTC 毫秒，STORED + FAST）以及 props_chars/props_prefixes 两个
+/// 输入即搜辅助字段，来自 Office `docProps/core.xml` 和 PDF Info 字典；旧索引
+/// 没有这些字段，按作者/标题搜不到，必须重建。
 /// 打开索引时版本对不上就要求重建，不做静默迁移、不做自动升级——旧字段布局
 /// 搜出来的结果不可靠，宁可让用户重建一次。
-pub(crate) const SCHEMA_VERSION: u32 = 7;
+pub(crate) const SCHEMA_VERSION: u32 = 8;
 
 /// 索引目录旁的元数据：schema 版本号 + 已注册的索引根目录列表 + 每个卷的
 /// USN 游标（里程碑 6）。

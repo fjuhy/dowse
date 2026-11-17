@@ -9,11 +9,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Instant, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use tantivy::{Index, IndexWriter, doc};
+use tantivy::{Index, IndexWriter, TantivyDocument, doc};
 use walkdir::WalkDir;
 
 use crate::cursor::{UsnCursor, VolumeKey};
-use crate::extract::{extract_text, is_extractable};
+use crate::extract::{DocProps, ExtractedDoc, extract_document, is_extractable};
 use crate::meta::{IndexMeta, SCHEMA_VERSION, save_meta};
 use crate::ocr;
 use crate::ocr_queue::OcrQueue;
@@ -232,7 +232,7 @@ pub(crate) fn add_file_document(
         });
     }
 
-    let Some(content) = extract_text(path) else {
+    let Some(extracted) = extract_document(path) else {
         // 抽不出文本可能只是不支持的格式/损坏，也可能是本应可抽取但体积超限。
         // 只对"本应可抽取的类型"再查一次体积，把超限跳过跟其它跳过区分开——
         // 普通不可抽取类型（.exe 等）不做这次多余的 stat。
@@ -244,6 +244,10 @@ pub(crate) fn add_file_document(
         }
         return Ok(AddOutcome::Skipped);
     };
+    let ExtractedDoc {
+        text: content,
+        props,
+    } = extracted;
     let (mtime, size) = file_stat(path).unwrap_or((0, 0));
 
     let name = path
@@ -258,7 +262,7 @@ pub(crate) fn add_file_document(
     // path_text 是 path 的分词镜像（专供 `path:` 查询），值和 path 完全相同，
     // 只是走 jieba 分词、不落 STORED；绑一次字符串两处共用，别求两遍。
     let path_str = path.to_string_lossy().into_owned();
-    writer.add_document(doc!(
+    let mut document = doc!(
         fields.path => path_str.clone(),
         fields.name => name.clone(),
         fields.ext => ext,
@@ -272,8 +276,29 @@ pub(crate) fn add_file_document(
         fields.content_chars => content.clone(),
         fields.name_prefixes => name,
         fields.content_prefixes => content,
-    ))?;
+    );
+    add_doc_props(&mut document, fields, &props);
+    writer.add_document(document)?;
     Ok(AddOutcome::Indexed)
+}
+
+/// 문서 속성(schema v8)을 문서에 붙인다. 값이 있는 것만 넣는다: 작성자/제목은
+/// 검색·표시 필드와 입력 즉시 검색 보조 필드(props_chars/props_prefixes)에 함께,
+/// 날짜는 UTC 밀리초로.
+fn add_doc_props(document: &mut TantivyDocument, fields: &Fields, props: &DocProps) {
+    for (field, value) in [(fields.title, &props.title), (fields.author, &props.author)] {
+        if let Some(value) = value {
+            document.add_text(field, value);
+            document.add_text(fields.props_chars, value);
+            document.add_text(fields.props_prefixes, value);
+        }
+    }
+    if let Some(created) = props.created {
+        document.add_i64(fields.doc_created, created);
+    }
+    if let Some(modified) = props.modified {
+        document.add_i64(fields.doc_modified, modified);
+    }
 }
 
 /// 图片文档：内容来自 OCR，可能是缓存命中的旧识别结果（全量重建索引时最常见），

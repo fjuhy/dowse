@@ -49,9 +49,39 @@ pub fn extract_text(path: &Path) -> Option<String> {
     extract_text_with(path, &crate::rules::active_rules())
 }
 
+/// 문서 속성(작성자·제목·작성일·수정일). docx/xlsx/pptx는 `docProps/core.xml`의
+/// `dc:creator`/`dc:title`/`dcterms:created`/`dcterms:modified`, PDF는 trailer의
+/// Info 사전(`/Author`/`/Title`/`/CreationDate`/`/ModDate`)에서 읽는다.
+/// 날짜는 UTC 기준 밀리초 Unix 타임스탬프(파일 mtime 필드와 같은 단위).
+/// 값이 없거나 형식을 못 읽으면 `None` — 속성은 있으면 좋은 부가 정보라
+/// 하나 못 읽었다고 본문 색인을 포기하지 않는다.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct DocProps {
+    pub author: Option<String>,
+    pub title: Option<String>,
+    pub created: Option<i64>,
+    pub modified: Option<i64>,
+}
+
+/// 본문 + 문서 속성. 색인 경로는 이걸 써서 PDF를 한 번만 연다.
+#[derive(Debug, Default)]
+pub(crate) struct ExtractedDoc {
+    pub text: String,
+    pub props: DocProps,
+}
+
+/// [`extract_text`]와 같은 규칙·같은 panic 방어로 본문과 문서 속성을 함께 뽑는다.
+pub(crate) fn extract_document(path: &Path) -> Option<ExtractedDoc> {
+    extract_document_with(path, &crate::rules::active_rules())
+}
+
 /// [`extract_text`] 的纯函数版：体积上限、追加扩展名都从显式规则读，不碰进程级
 /// 全局，便于单测。零参的 `extract_text` 只是用当前生效规则调它。
 fn extract_text_with(path: &Path, rules: &IndexRules) -> Option<String> {
+    extract_document_with(path, rules).map(|doc| doc.text)
+}
+
+fn extract_document_with(path: &Path, rules: &IndexRules) -> Option<ExtractedDoc> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
 
     let meta = fs::metadata(path).ok()?;
@@ -75,25 +105,246 @@ fn extract_text_with(path: &Path, rules: &IndexRules) -> Option<String> {
     // 若畸形输入触发深度递归把线程栈撑爆，那是栈溢出，走的是 SIGABRT/进程 abort，
     // `catch_unwind` 接不住，进程仍会整体退出——这一类只能靠上游解析库自身的
     // 递归深度限制来防，不在本函数的兜底范围内。
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match ext.as_str() {
-        "pdf" => extract_pdf(path),
-        "docx" => extract_docx(path),
-        "xlsx" => extract_xlsx(path),
-        "pptx" => extract_pptx(path),
-        e if TEXT_EXTS.contains(&e) => read_text_smart(path),
-        // 追加白名单里的扩展名当纯文本读（自动探测编码），跟内建文本类型同路。
-        e if rules.is_extra_text_ext(e) => read_text_smart(path),
-        _ => None,
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let plain = |text: Option<String>| {
+            text.map(|text| ExtractedDoc {
+                text,
+                props: DocProps::default(),
+            })
+        };
+        let office = |text: Option<String>| {
+            text.map(|text| ExtractedDoc {
+                text,
+                props: office_props(path),
+            })
+        };
+        match ext.as_str() {
+            "pdf" => extract_pdf(path),
+            "docx" => office(extract_docx(path)),
+            "xlsx" => office(extract_xlsx(path)),
+            "pptx" => office(extract_pptx(path)),
+            e if TEXT_EXTS.contains(&e) => plain(read_text_smart(path)),
+            // 追加白名单里的扩展名当纯文本读（自动探测编码），跟内建文本类型同路。
+            e if rules.is_extra_text_ext(e) => plain(read_text_smart(path)),
+            _ => None,
+        }
     }))
     .ok()
     .flatten()
 }
 
-/// 从 PDF 抽文本。畸形 PDF 触发的 panic 由 `extract_text` 那层统一的
-/// `catch_unwind` 兜底（见其文档），这里只走正常路径：`pdf_extract` 返回 `Err`
-/// 时（可正常识别的错误）用 `.ok()` 落成 `None`。
-fn extract_pdf(path: &Path) -> Option<String> {
-    pdf_extract::extract_text(path).ok()
+/// 从 PDF 抽文本和 Info 속성。畸形 PDF 触发的 panic 由 `extract_text` 那层统一的
+/// `catch_unwind` 兜底（见其文档），这里只走正常路径：出错时落成 `None`。
+/// 跟 `pdf_extract::extract_text` 同一流程（加载 → 空密码解密 → 输出纯文本），
+/// 只是自己持有 `Document`，好顺手读 trailer 里的 Info 사전，不必把文件读两遍。
+fn extract_pdf(path: &Path) -> Option<ExtractedDoc> {
+    let mut doc = pdf_extract::Document::load(path).ok()?;
+    if doc.is_encrypted() {
+        doc.decrypt("").ok()?;
+    }
+    let mut text = String::new();
+    {
+        let mut output = pdf_extract::PlainTextOutput::new(&mut text);
+        pdf_extract::output_doc(&doc, &mut output).ok()?;
+    }
+    Some(ExtractedDoc {
+        text,
+        props: pdf_props(&doc),
+    })
+}
+
+/// PDF trailer의 `/Info` 사전에서 문서 속성을 읽는다.
+fn pdf_props(doc: &pdf_extract::Document) -> DocProps {
+    let Ok(info) = doc
+        .trailer
+        .get_deref(b"Info", doc)
+        .and_then(|o| o.as_dict())
+    else {
+        return DocProps::default();
+    };
+    let text = |key: &[u8]| {
+        info.get_deref(key, doc)
+            .ok()
+            .and_then(|o| o.as_str().ok())
+            .map(decode_pdf_text_string)
+            .and_then(non_empty)
+    };
+    DocProps {
+        author: text(b"Author"),
+        title: text(b"Title"),
+        created: text(b"CreationDate").and_then(|s| parse_pdf_date(&s)),
+        modified: text(b"ModDate").and_then(|s| parse_pdf_date(&s)),
+    }
+}
+
+/// PDF text string 디코딩: UTF-16BE(BOM `FE FF`), UTF-8(BOM `EF BB BF`, PDF 2.0),
+/// 그 외는 PDFDocEncoding — ASCII 범위는 같고 나머지는 Latin-1로 근사한다.
+fn decode_pdf_text_string(bytes: &[u8]) -> String {
+    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        let units: Vec<u16> = rest
+            .chunks_exact(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
+        return String::from_utf16_lossy(&units);
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        return String::from_utf8_lossy(rest).into_owned();
+    }
+    bytes.iter().map(|&b| char::from(b)).collect()
+}
+
+/// docx/xlsx/pptx 공통: `docProps/core.xml`에서 속성을 읽는다. 항목이 없으면 기본값.
+fn office_props(path: &Path) -> DocProps {
+    let Some(xml) = read_zip_entry(path, "docProps/core.xml") else {
+        return DocProps::default();
+    };
+    let field = |tag: &[u8]| non_empty(extract_tagged_text(&xml, tag, None));
+    DocProps {
+        author: field(b"creator"),
+        title: field(b"title"),
+        created: field(b"created").and_then(|s| parse_w3c_datetime(&s)),
+        modified: field(b"modified").and_then(|s| parse_w3c_datetime(&s)),
+    }
+}
+
+fn non_empty(s: String) -> Option<String> {
+    let s = s.trim();
+    (!s.is_empty()).then(|| s.to_string())
+}
+
+/// 그레고리력 날짜 → 1970-01-01 기준 일수 (Howard Hinnant의 days_from_civil).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// 각 구성요소 범위를 확인하고 UTC 밀리초로 바꾼다. `offset_min`은 현지 시각의
+/// UTC 오프셋(분)이라 빼 준다.
+fn to_epoch_millis(
+    (y, mo, d, h, mi, s): (i64, i64, i64, i64, i64, i64),
+    millis: i64,
+    offset_min: i64,
+) -> Option<i64> {
+    if !(1..=12).contains(&mo)
+        || !(1..=31).contains(&d)
+        || !(0..=23).contains(&h)
+        || !(0..=59).contains(&mi)
+        || !(0..=60).contains(&s)
+    {
+        return None;
+    }
+    let days = days_from_civil(y, mo, d);
+    let secs = days * 86_400 + h * 3_600 + mi * 60 + s - offset_min * 60;
+    Some(secs * 1_000 + millis)
+}
+
+/// 앞에서 숫자 `n`자리를 읽는다.
+fn take_digits(s: &mut &str, n: usize) -> Option<i64> {
+    let head = s.get(..n)?;
+    if !head.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    *s = &s[n..];
+    head.parse().ok()
+}
+
+/// W3CDTF(`dcterms:created`/`modified`의 형식, ISO 8601의 부분집합):
+/// `YYYY`, `YYYY-MM`, `YYYY-MM-DD`, `YYYY-MM-DDThh:mm[:ss[.s+]](Z|±hh:mm)`.
+/// 시간대가 없으면 UTC로 본다.
+fn parse_w3c_datetime(s: &str) -> Option<i64> {
+    let mut rest = s.trim();
+    let y = take_digits(&mut rest, 4)?;
+    let mut parts = (y, 1, 1, 0, 0, 0);
+    let mut millis = 0;
+    let mut offset = 0;
+    if let Some(r) = rest.strip_prefix('-') {
+        rest = r;
+        parts.1 = take_digits(&mut rest, 2)?;
+        if let Some(r) = rest.strip_prefix('-') {
+            rest = r;
+            parts.2 = take_digits(&mut rest, 2)?;
+            if let Some(r) = rest.strip_prefix(['T', 't', ' ']) {
+                rest = r;
+                parts.3 = take_digits(&mut rest, 2)?;
+                rest = rest.strip_prefix(':')?;
+                parts.4 = take_digits(&mut rest, 2)?;
+                if let Some(r) = rest.strip_prefix(':') {
+                    rest = r;
+                    parts.5 = take_digits(&mut rest, 2)?;
+                    if let Some(r) = rest.strip_prefix('.') {
+                        let frac_len = r.bytes().take_while(u8::is_ascii_digit).count();
+                        if frac_len == 0 {
+                            return None;
+                        }
+                        let frac = &r[..frac_len];
+                        let padded = format!("{:0<3}", &frac[..frac.len().min(3)]);
+                        millis = padded.parse().ok()?;
+                        rest = &r[frac_len..];
+                    }
+                }
+                if let Some(r) = rest.strip_prefix(['Z', 'z']) {
+                    rest = r;
+                } else if let Some(sign) = rest.chars().next().filter(|c| *c == '+' || *c == '-') {
+                    rest = &rest[1..];
+                    let oh = take_digits(&mut rest, 2)?;
+                    rest = rest.strip_prefix(':').unwrap_or(rest);
+                    let om = take_digits(&mut rest, 2)?;
+                    offset = (oh * 60 + om) * if sign == '-' { -1 } else { 1 };
+                }
+            }
+        }
+    }
+    if !rest.is_empty() {
+        return None;
+    }
+    to_epoch_millis(parts, millis, offset)
+}
+
+/// PDF 날짜 문자열(PDF 32000-1 §7.9.4): `D:YYYYMMDDHHmmSSOHH'mm'`.
+/// `D:` 접두어와 연 이후의 모든 부분은 생략 가능하고, `O`는 `Z`/`+`/`-`.
+/// 오프셋이 없으면 UTC로 본다. 일부 생성기가 붙이는 끝의 `'`도 허용.
+fn parse_pdf_date(s: &str) -> Option<i64> {
+    let mut rest = s.trim();
+    rest = rest.strip_prefix("D:").unwrap_or(rest);
+    let y = take_digits(&mut rest, 4)?;
+    let mut parts = (y, 1, 1, 0, 0, 0);
+    let mut offset = 0;
+    let fields: [&mut i64; 5] = [
+        &mut parts.1,
+        &mut parts.2,
+        &mut parts.3,
+        &mut parts.4,
+        &mut parts.5,
+    ];
+    for slot in fields {
+        if !rest.starts_with(|c: char| c.is_ascii_digit()) {
+            break;
+        }
+        *slot = take_digits(&mut rest, 2)?;
+    }
+    if let Some(sign) = rest.chars().next() {
+        match sign {
+            'Z' | 'z' => rest = &rest[1..],
+            '+' | '-' => {
+                rest = &rest[1..];
+                let oh = take_digits(&mut rest, 2)?;
+                rest = rest.strip_prefix('\'').unwrap_or(rest);
+                let om = take_digits(&mut rest, 2).unwrap_or(0);
+                offset = (oh * 60 + om) * if sign == '-' { -1 } else { 1 };
+            }
+            _ => return None,
+        }
+        rest = rest.trim_end_matches('\'');
+    }
+    if !rest.is_empty() {
+        return None;
+    }
+    to_epoch_millis(parts, 0, offset)
 }
 
 /// 打开一个 zip 包里的单个条目，读成字节。条目不存在/包本身打不开（损坏、
@@ -620,5 +871,165 @@ mod tests {
             !text.contains("CORRUPTME_SHEET1_UNIQUE"),
             "坏掉的 sheet 内容不应出现在结果里"
         );
+    }
+
+    // --- 문서 속성 (schema v8) ---
+
+    const CORE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
+  xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <dc:title>R&amp;D 분기 보고서</dc:title>
+  <dc:creator>&#54861;길동</dc:creator>
+  <cp:lastModifiedBy>someone-else</cp:lastModifiedBy>
+  <dcterms:created xsi:type="dcterms:W3CDTF">2024-03-05T01:02:03Z</dcterms:created>
+  <dcterms:modified xsi:type="dcterms:W3CDTF">2024-03-06T10:00:00+09:00</dcterms:modified>
+</cp:coreProperties>"#;
+
+    const DOCX_BODY: &str = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>본문</w:t></w:r></w:p></w:body></w:document>"#;
+
+    #[test]
+    fn docx_core_properties_are_extracted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("props.docx");
+        write_zip(
+            &path,
+            &[
+                ("word/document.xml", DOCX_BODY),
+                ("docProps/core.xml", CORE_XML),
+            ],
+        );
+        let doc = extract_document_with(&path, &IndexRules::default()).expect("본문이 있어야 함");
+        assert_eq!(doc.text, "본문");
+        assert_eq!(doc.props.title.as_deref(), Some("R&D 분기 보고서"));
+        assert_eq!(doc.props.author.as_deref(), Some("홍길동"));
+        assert_eq!(doc.props.created, Some(1_709_600_523_000));
+        // 2024-03-06T10:00:00+09:00 == 2024-03-06T01:00:00Z
+        assert_eq!(doc.props.modified, Some(1_709_686_800_000));
+    }
+
+    #[test]
+    fn xlsx_and_pptx_read_the_same_core_properties() {
+        let dir = tempfile::tempdir().unwrap();
+        let xlsx = dir.path().join("props.xlsx");
+        write_zip(
+            &xlsx,
+            &[
+                ("xl/sharedStrings.xml", "<sst><si><t>셀</t></si></sst>"),
+                ("docProps/core.xml", CORE_XML),
+            ],
+        );
+        let pptx = dir.path().join("props.pptx");
+        write_zip(
+            &pptx,
+            &[
+                (
+                    "ppt/slides/slide1.xml",
+                    "<p:sld xmlns:a=\"a\" xmlns:p=\"p\"><a:p><a:r><a:t>슬라이드</a:t></a:r></a:p></p:sld>",
+                ),
+                ("docProps/core.xml", CORE_XML),
+            ],
+        );
+        for path in [xlsx, pptx] {
+            let doc = extract_document_with(&path, &IndexRules::default()).unwrap();
+            assert_eq!(doc.props.author.as_deref(), Some("홍길동"), "{path:?}");
+            assert_eq!(doc.props.title.as_deref(), Some("R&D 분기 보고서"));
+        }
+    }
+
+    #[test]
+    fn missing_or_empty_core_properties_yield_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let no_core = dir.path().join("nocore.docx");
+        write_zip(&no_core, &[("word/document.xml", DOCX_BODY)]);
+        let doc = extract_document_with(&no_core, &IndexRules::default()).unwrap();
+        assert_eq!(doc.props, DocProps::default());
+
+        let empty = dir.path().join("empty.docx");
+        let core = r#"<cp:coreProperties xmlns:cp="c" xmlns:dc="d" xmlns:dcterms="t"><dc:creator>  </dc:creator><dc:title/><dcterms:created>not a date</dcterms:created></cp:coreProperties>"#;
+        write_zip(
+            &empty,
+            &[
+                ("word/document.xml", DOCX_BODY),
+                ("docProps/core.xml", core),
+            ],
+        );
+        let doc = extract_document_with(&empty, &IndexRules::default()).unwrap();
+        assert_eq!(doc.props, DocProps::default());
+
+        // 텍스트 파일은 속성이 없다.
+        let txt = dir.path().join("a.txt");
+        fs::write(&txt, "plain").unwrap();
+        let doc = extract_document_with(&txt, &IndexRules::default()).unwrap();
+        assert_eq!(doc.props, DocProps::default());
+    }
+
+    #[test]
+    fn w3c_datetime_variants() {
+        assert_eq!(parse_w3c_datetime("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_w3c_datetime("1970-01-01"), Some(0));
+        assert_eq!(parse_w3c_datetime("1970"), Some(0));
+        assert_eq!(parse_w3c_datetime("1970-02"), Some(31 * 86_400_000));
+        assert_eq!(
+            parse_w3c_datetime("2000-02-29T12:00Z"),
+            Some(951_825_600_000)
+        );
+        assert_eq!(
+            parse_w3c_datetime("2024-03-05T01:02:03.5Z"),
+            Some(1_709_600_523_500)
+        );
+        assert_eq!(
+            parse_w3c_datetime("2024-03-05T01:02:03.123456-05:00"),
+            Some(1_709_600_523_123 + 5 * 3_600_000)
+        );
+        assert_eq!(
+            parse_w3c_datetime("2024-03-05T01:02:03"),
+            Some(1_709_600_523_000)
+        );
+        for bad in [
+            "",
+            "abc",
+            "2024-13-01",
+            "2024-03-05T25:00Z",
+            "2024-03-05Tjunk",
+            "2024-03-05T01:02:03Zx",
+        ] {
+            assert_eq!(parse_w3c_datetime(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn pdf_date_variants() {
+        assert_eq!(parse_pdf_date("D:19700101000000Z"), Some(0));
+        assert_eq!(parse_pdf_date("D:1970"), Some(0));
+        assert_eq!(parse_pdf_date("19700101"), Some(0));
+        assert_eq!(
+            parse_pdf_date("D:20240306100000+09'00'"),
+            Some(1_709_686_800_000)
+        );
+        assert_eq!(
+            parse_pdf_date("D:20240306100000+09'00"),
+            Some(1_709_686_800_000)
+        );
+        assert_eq!(
+            parse_pdf_date("D:20240305200000-05'00'"),
+            Some(1_709_686_800_000)
+        );
+        for bad in ["", "D:", "D:20241301", "D:2024xx", "hello"] {
+            assert_eq!(parse_pdf_date(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn pdf_text_string_encodings() {
+        let mut utf16 = vec![0xFE, 0xFF];
+        for u in "홍길동".encode_utf16() {
+            utf16.extend_from_slice(&u.to_be_bytes());
+        }
+        assert_eq!(decode_pdf_text_string(&utf16), "홍길동");
+        let mut utf8 = vec![0xEF, 0xBB, 0xBF];
+        utf8.extend_from_slice("보고서".as_bytes());
+        assert_eq!(decode_pdf_text_string(&utf8), "보고서");
+        assert_eq!(decode_pdf_text_string(b"Jane Doe"), "Jane Doe");
     }
 }

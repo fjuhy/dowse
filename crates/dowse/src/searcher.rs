@@ -206,6 +206,12 @@ pub struct SearchHit {
     pub highlighted: Vec<Range<usize>>,
     /// 文件扩展名（不含点，小写），无扩展名时是空串。给 MCP 等消费方标注文件类型用。
     pub ext: String,
+    /// 문서 속성(schema v8): Office `docProps/core.xml` 또는 PDF Info의 작성자/제목.
+    pub author: Option<String>,
+    pub title: Option<String>,
+    /// 문서 속성의 작성일/수정일(UTC 밀리초 Unix 타임스탬프). 파일 시스템 mtime과 별개.
+    pub doc_created: Option<i64>,
+    pub doc_modified: Option<i64>,
 }
 
 /// 按路径取的预览内容，字段契约和 SearchHit 的 snippet/highlighted 一致，
@@ -293,8 +299,11 @@ impl Searcher {
         register_tokenizers(&index);
 
         let (_, fields) = build_schema();
-        // 不带字段前缀的查询词，默认同时查文件名和正文
-        let mut parser = QueryParser::for_index(&index, vec![fields.name, fields.content]);
+        // 不带字段前缀的查询词，默认同时查文件名、正文和文档属性（作者/标题，schema v8）
+        let mut parser = QueryParser::for_index(
+            &index,
+            vec![fields.name, fields.content, fields.title, fields.author],
+        );
         // tantivy 默认词间是 OR，浮窗场景下多词应该收窄结果而不是放宽——
         // 用户敲"限流 中间件"是想要同时含两个词的文档，不是含任意一个词都行。
         // 带引号的短语查询不受影响，QueryParser 会先切出短语再对词间加 AND。
@@ -542,12 +551,22 @@ impl Searcher {
                 }
                 None => snippet_with_fallback(&snippet_gen, content, SNIPPET_MAX_CHARS),
             };
+            let text_prop = |field| {
+                doc.get_first(field)
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+            };
+            let date_prop = |field| doc.get_first(field).and_then(|v| v.as_i64());
             hits.push(SearchHit {
                 path,
                 score,
                 snippet,
                 highlighted,
                 ext,
+                author: text_prop(self.fields.author),
+                title: text_prop(self.fields.title),
+                doc_created: date_prop(self.fields.doc_created),
+                doc_modified: date_prop(self.fields.doc_modified),
             });
         }
         Ok(SearchPage { hits, total })
@@ -588,20 +607,26 @@ impl Searcher {
         let mut snippet = Vec::with_capacity(parts.len());
 
         for (index, part) in parts.iter().enumerate() {
-            let (name_query, content_query, snippet_query) = match part {
+            let (name_query, content_query, props_query, snippet_query) = match part {
                 TypeaheadPart::Cjk(chars) => (
                     cjk_phrase_query(self.fields.name_chars, chars),
                     cjk_phrase_query(self.fields.content_chars, chars),
+                    cjk_phrase_query(self.fields.props_chars, chars),
                     cjk_phrase_query(self.fields.content_chars, chars),
                 ),
                 TypeaheadPart::Word(word) if prefix_last && index == last => (
                     word_prefix_query(self.fields.name_prefixes, self.fields.name, word)?,
                     word_prefix_query(self.fields.content_prefixes, self.fields.content, word)?,
+                    word_prefix_query(self.fields.props_prefixes, self.fields.author, word)?,
                     word_prefix_query(self.fields.content_prefixes, self.fields.content, word)?,
                 ),
                 TypeaheadPart::Word(word) => (
                     term_query(self.fields.name, word),
                     term_query(self.fields.content, word),
+                    Box::new(BooleanQuery::new(vec![
+                        (Occur::Should, term_query(self.fields.author, word)),
+                        (Occur::Should, term_query(self.fields.title, word)),
+                    ])) as Box<dyn Query>,
                     term_query(self.fields.content, word),
                 ),
             };
@@ -610,6 +635,8 @@ impl Searcher {
                 Box::new(BooleanQuery::new(vec![
                     (Occur::Should, name_query),
                     (Occur::Should, content_query),
+                    // 문서 속성(작성자/제목)만 맞아도 찾히게 한다.
+                    (Occur::Should, props_query),
                 ])) as Box<dyn Query>,
             ));
             snippet.push((Occur::Must, snippet_query));
