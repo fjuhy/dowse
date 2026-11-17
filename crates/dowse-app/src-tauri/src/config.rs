@@ -114,7 +114,7 @@ impl ConfigState {
         save(&guard)
     }
 
-    /// 设置面板"界面语言"落盘。取值合法性（auto/zh/en）由 `commands::set_lang`
+    /// 设置面板"界面语言"落盘。取值合法性（auto/zh/en/ko）由 `commands::set_lang`
     /// 把关，这层只管持久化。
     pub fn set_lang(&self, lang: String) -> Result<()> {
         let mut guard = self.0.lock().expect("config mutex poisoned");

@@ -376,7 +376,8 @@ fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
         MENU_HELP_GUIDE => {
             let url = match crate::i18n::lang() {
                 crate::i18n::Lang::Zh => GUIDE_ZH_URL,
-                crate::i18n::Lang::En => GUIDE_EN_URL,
+                // 指南没有韩文版，韩文界面走英文指南。
+                crate::i18n::Lang::En | crate::i18n::Lang::Ko => GUIDE_EN_URL,
             };
             if let Err(err) = app.opener().open_url(url, None::<&str>) {
                 eprintln!("打开使用指南失败: {err}");

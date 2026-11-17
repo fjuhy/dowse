@@ -1,6 +1,6 @@
-//! 托盘菜单、原生右键菜单等 Rust 侧界面文案的中英双语，跟随系统 UI 语言：
-//! `GetUserDefaultUILanguage` 的主语言是中文（LANG_CHINESE）走中文，其余一律
-//! 英文。判定只做一次并缓存（`OnceLock`），没有运行时切换、没有设置项。跟前端
+//! 托盘菜单、原生右键菜单等 Rust 侧界面文案（中/英/韩），跟随系统 UI 语言：
+//! `GetUserDefaultUILanguage` 的主语言是中文（LANG_CHINESE）走中文，韩文
+//! （LANG_KOREAN）走韩文，其余一律英文。判定只做一次并缓存（`OnceLock`），没有运行时切换、没有设置项。跟前端
 //! `lib/i18n.ts` 是对称的两套（各自平台各自检测），不共享数据。开发者面向的
 //! `eprintln!` 诊断日志不在此列，仍按仓库惯例保留中文。
 
@@ -10,6 +10,7 @@ use std::sync::OnceLock;
 pub enum Lang {
     Zh,
     En,
+    Ko,
 }
 
 #[cfg(target_os = "windows")]
@@ -18,10 +19,11 @@ fn detect_lang() -> Lang {
     // LANGID 低 10 位是主语言 ID；中文（简繁及各地区变体）主语言都是
     // LANG_CHINESE = 0x04，用它一刀切判定"是不是中文系统"，不细分地区。
     let langid = unsafe { GetUserDefaultUILanguage() };
-    if (langid & 0x3ff) == 0x04 {
-        Lang::Zh
-    } else {
-        Lang::En
+    // LANG_KOREAN = 0x12。
+    match langid & 0x3ff {
+        0x04 => Lang::Zh,
+        0x12 => Lang::Ko,
+        _ => Lang::En,
     }
 }
 
@@ -37,7 +39,7 @@ pub fn lang() -> Lang {
 }
 
 /// 语言解析：设置面板可以把界面语言钉死（写进 `config.lang`），config 是
-/// 权威存储。这里在进程首次取语言时读一次配置——显式选了 "zh"/"en" 就用它，
+/// 权威存储。这里在进程首次取语言时读一次配置——显式选了 "zh"/"en"/"ko" 就用它，
 /// "auto"/没配过才回落到系统 UI 语言检测。只解析一次（`OnceLock` 缓存），
 /// 运行中改了配置也不热切，跟设置面板"改语言重启后生效"的交互一致。这里读
 /// 文件（`config::load`）而不是 `ConfigState`，是为了让不持有 `AppHandle` 的
@@ -46,6 +48,7 @@ fn resolve_lang() -> Lang {
     match crate::config::load().lang.as_str() {
         "zh" => Lang::Zh,
         "en" => Lang::En,
+        "ko" => Lang::Ko,
         _ => detect_lang(),
     }
 }
@@ -130,10 +133,36 @@ const EN: Strings = Strings {
     ctx_copy_name: "Copy file name",
 };
 
+const KO: Strings = Strings {
+    idle_tooltip: "dowse — Alt+`로 열기",
+    menu_show: "dowse 열기",
+    menu_settings: "설정…",
+    menu_autostart: "시작 시 자동 실행",
+    help_submenu: "도움말 및 의견",
+    help_guide: "사용 안내",
+    help_feedback: "문제 신고 또는 의견 보내기…",
+    menu_quit: "종료",
+    folders_submenu: "색인 폴더",
+    root_docs_unit: "개 문서",
+    rebuild_item: "다시 만들기",
+    remove_item: "제거",
+    add_folder_item: "폴더 추가…",
+    tooltip_indexing_prefix: "dowse — 색인 중 ",
+    tooltip_indexing_suffix: "개 문서",
+    tooltip_ocr_prefix: "dowse — 이미지 글자 인식 ",
+    dialog_pick_folder: "색인할 폴더 선택",
+    stale_root_error: "이 색인 폴더를 찾을 수 없습니다. 메뉴가 오래되었을 수 있으니 트레이 메뉴를 다시 여세요.",
+    ctx_open: "열기",
+    ctx_reveal: "파일 탐색기에서 보기",
+    ctx_copy_path: "전체 경로 복사",
+    ctx_copy_name: "파일 이름 복사",
+};
+
 /// 当前语言对应的整张文案表。
 pub fn strings() -> &'static Strings {
     match lang() {
         Lang::Zh => &ZH,
         Lang::En => &EN,
+        Lang::Ko => &KO,
     }
 }
