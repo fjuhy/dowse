@@ -380,11 +380,11 @@ pub fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<(), String>
 }
 
 /// 设置面板"界面语言"：只落盘，不做运行时热切换（见 `config.rs` 的 `lang`
-/// 字段说明与前端 `i18n.ts`）。只认 auto/zh/en 三种取值，多一道防御防止脏值
+/// 字段说明与前端 `i18n.ts`）。只认 auto/zh/en/ko 四种取值，多一道防御防止脏值
 /// 落盘让下次启动的语言解析出意外。
 #[tauri::command]
 pub fn set_lang(config: State<ConfigState>, lang: String) -> Result<(), String> {
-    if !matches!(lang.as_str(), "auto" | "zh" | "en") {
+    if !matches!(lang.as_str(), "auto" | "zh" | "en" | "ko") {
         return Err(format!("不支持的语言取值：{lang}"));
     }
     config.set_lang(lang).map_err(|e| e.to_string())

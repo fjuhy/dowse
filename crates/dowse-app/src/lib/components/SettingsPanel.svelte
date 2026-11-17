@@ -79,7 +79,8 @@
 	const LANG_OPTIONS: { value: LangOption; label: string }[] = [
 		{ value: 'auto', label: t.setLangAuto },
 		{ value: 'zh', label: t.setLangZh },
-		{ value: 'en', label: t.setLangEn }
+		{ value: 'en', label: t.setLangEn },
+		{ value: 'ko', label: t.setLangKo }
 	];
 	const ONOFF_OPTIONS = [
 		{ value: 'off', label: t.setOff },
