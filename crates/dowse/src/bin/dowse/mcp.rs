@@ -96,6 +96,19 @@ pub struct SearchHitOut {
     pub snippet: String,
     /// 文件扩展名（不含点，小写），无扩展名是空串
     pub kind: String,
+    /// 文档属性里的作者（Office docProps/core.xml 的 creator 或 PDF Info 的 Author）；
+    /// 没有时省略
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    /// 文档属性里的标题（不是文件名）；没有时省略
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// 文档属性里的创建时间，Unix 毫秒时间戳（UTC）；与文件系统 mtime 无关，没有时省略
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_created_unix_ms: Option<i64>,
+    /// 文档属性里的修改时间，Unix 毫秒时间戳（UTC）；与文件系统 mtime 无关，没有时省略
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_modified_unix_ms: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -174,6 +187,10 @@ fn to_search_hit_out(hit: SearchHit, include_score: bool) -> SearchHitOut {
         score: include_score.then_some(hit.score),
         snippet: mark_highlights(&hit.snippet, &hit.highlighted),
         kind: hit.ext,
+        author: hit.author,
+        title: hit.title,
+        doc_created_unix_ms: hit.doc_created,
+        doc_modified_unix_ms: hit.doc_modified,
     }
 }
 
@@ -912,5 +929,72 @@ mod tests {
             .unwrap();
         assert_eq!(page2.hits.len(), 1);
         assert_ne!(page1.hits[0].path, page2.hits[0].path, "翻页应拿到不同文档");
+    }
+
+    /// 文档属性（schema v8）要原样透出到 search 结果里；没有属性的文件四个字段整个省略。
+    #[tokio::test]
+    async fn search_hits_carry_document_properties() {
+        use std::io::Write;
+
+        let index_dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::Builder::new()
+            .prefix("dowse-mcp-props-")
+            .tempdir()
+            .unwrap();
+        let core = r#"<?xml version="1.0" encoding="UTF-8"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
+  xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/">
+  <dc:title>계통한계가격 분석</dc:title>
+  <dc:creator>홍길동</dc:creator>
+  <dcterms:created>2024-03-05T01:02:03Z</dcterms:created>
+  <dcterms:modified>2024-03-06T10:00:00+09:00</dcterms:modified>
+</cp:coreProperties>"#;
+        let body = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>propsmarker body</w:t></w:r></w:p></w:body></w:document>"#;
+        {
+            let file = std::fs::File::create(target_dir.path().join("report.docx")).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default();
+            for (name, content) in [("word/document.xml", body), ("docProps/core.xml", core)] {
+                zip.start_file(name, options).unwrap();
+                zip.write_all(content.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        std::fs::write(target_dir.path().join("plain.md"), "propsmarker plain").unwrap();
+        dowse::rebuild_index(index_dir.path(), target_dir.path()).unwrap();
+
+        let server = DowseMcpServer::new(index_dir.path().to_path_buf());
+        let result = server
+            .search(Parameters(SearchParams {
+                query: "propsmarker".to_owned(),
+                limit: None,
+                offset: None,
+                ext: None,
+                sort: None,
+            }))
+            .await
+            .unwrap();
+        let raw = result.structured_content.clone().unwrap();
+        let out: SearchOutput = result.into_typed().unwrap();
+        assert_eq!(out.total_hits, 2);
+
+        let docx = out.hits.iter().find(|h| h.kind == "docx").unwrap();
+        assert_eq!(docx.author.as_deref(), Some("홍길동"));
+        assert_eq!(docx.title.as_deref(), Some("계통한계가격 분석"));
+        assert_eq!(docx.doc_created_unix_ms, Some(1_709_600_523_000));
+        assert_eq!(docx.doc_modified_unix_ms, Some(1_709_686_800_000));
+
+        let md = out.hits.iter().find(|h| h.kind == "md").unwrap();
+        assert_eq!(md.author, None);
+        // 没有属性时字段整个省略，而不是 null。
+        let md_raw = raw["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h["kind"] == "md")
+            .unwrap();
+        for key in ["author", "title", "doc_created_unix_ms", "doc_modified_unix_ms"] {
+            assert!(md_raw.get(key).is_none(), "{key} 应被省略: {md_raw}");
+        }
     }
 }
