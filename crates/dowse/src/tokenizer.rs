@@ -14,6 +14,9 @@
 //! 字节就是切串 panic，不只是搜错。所以汉字段喂给 jieba 后要把它给出的
 //! 段内 offset 加回该段在原串里的字节基址。
 
+use std::borrow::Cow;
+use std::sync::OnceLock;
+
 use tantivy::tokenizer::{Token, TokenStream, Tokenizer};
 use unicode_script::{Script, UnicodeScript};
 
@@ -30,9 +33,110 @@ pub(crate) fn is_cjk(ch: char) -> bool {
     )
 }
 
-/// 主相关性字段仍只有 Han 交给 jieba；日文假名和韩文不改变原有分词路径。
+/// 主相关性字段仍只有 Han 交给 jieba；日文假名不改变原有分词路径。
 fn is_jieba_han(ch: char) -> bool {
     ch.script() == Script::Han
+}
+
+/// 한글(Hangul script) 구간은 lindera + ko-dic 형태소 분석으로 넘긴다.
+fn is_hangul(ch: char) -> bool {
+    ch.script() == Script::Hangul
+}
+
+/// 主分词器眼里的三类 run：汉字（jieba）、한글（lindera ko-dic）、其余（字母数字切分）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RunKind {
+    Han,
+    Hangul,
+    Other,
+}
+
+fn run_kind(ch: char) -> RunKind {
+    if is_jieba_han(ch) {
+        RunKind::Han
+    } else if is_hangul(ch) {
+        RunKind::Hangul
+    } else {
+        RunKind::Other
+    }
+}
+
+/// ko-dic 사전 디렉터리를 찾을 때 쓰는 환경 변수.
+pub(crate) const KO_DIC_ENV: &str = "DOWSE_KO_DIC";
+
+/// 실행 파일 옆에 둘 ko-dic 사전 디렉터리 이름(`<exe 폴더>/ko-dic/`).
+pub(crate) const KO_DIC_DIR_NAME: &str = "ko-dic";
+
+/// ko-dic 사전 후보 위치. 순서: `DOWSE_KO_DIC` → 실행 파일 옆 `ko-dic/` →
+/// 바이너리에 내장된 사전(`embed-ko-dic` feature로 빌드했을 때만 존재).
+///
+/// 사전을 기본으로 내장하지 않는 이유: 컴파일된 ko-dic은 약 82MB이고 설치 파일에는
+/// 앱과 CLI sidecar가 둘 다 들어가 엔진이 두 번 링크된다. 내장하면 release CLI가
+/// 10,069,392 → 96,609,312 bytes로 커져 README의 설치 파일 예산(<50MB)을 넘는다.
+/// 별도 디렉터리로 두면 앱과 CLI가 한 벌을 공유하고 mmap으로 읽는다.
+fn ko_dic_candidates() -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(dir) = std::env::var_os(KO_DIC_ENV).filter(|v| !v.is_empty()) {
+        out.push(dir.to_string_lossy().into_owned());
+    }
+    if let Some(exe_dir) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(KO_DIC_DIR_NAME)))
+        && exe_dir.join("metadata.json").is_file()
+    {
+        out.push(exe_dir.to_string_lossy().into_owned());
+    }
+    out.push("embedded://ko-dic".to_string());
+    out
+}
+
+/// ko-dic 세그멘터는 처음 한글을 만났을 때 한 번만 만든다(lazy 로딩: 한국어를
+/// 안 쓰는 사용자는 사전을 열지도 않는다). 어디서도 사전을 못 찾으면 `None`을
+/// 기억해 두고 이후 한글 구간은 모두 어절 통째로 1 token 처리로 대체한다
+/// (형태소 분석 도입 전과 같은 동작).
+fn ko_segmenter() -> Option<&'static lindera::segmenter::Segmenter> {
+    static SEGMENTER: OnceLock<Option<lindera::segmenter::Segmenter>> = OnceLock::new();
+    SEGMENTER
+        .get_or_init(|| {
+            let dictionary = ko_dic_candidates().into_iter().find_map(|uri| {
+                lindera::dictionary::load_dictionary_with_options(&uri, true).ok()
+            })?;
+            Some(lindera::segmenter::Segmenter::new(
+                lindera::mode::Mode::Normal,
+                dictionary,
+                None,
+            ))
+        })
+        .as_ref()
+}
+
+/// 한국어 형태소 분석 사전을 쓸 수 있는지(없으면 한글은 어절 단위로 색인됨).
+pub fn korean_morphology_available() -> bool {
+    ko_segmenter().is_some()
+}
+
+/// lindera가 돌려준 run 내부 byte 구간들을 검증한다. 비어 있지 않고, 서로 겹치지
+/// 않게 앞에서 뒤로 진행하며, run 범위 안에서 char boundary에 걸려야 한다.
+/// 하나라도 어긋나면 `None` — 호출 측이 그 run만 기존 방식으로 대체한다.
+fn ko_spans(run: &str) -> Option<Vec<(usize, usize)>> {
+    let segmenter = ko_segmenter()?;
+    let tokens = segmenter.segment(Cow::Borrowed(run)).ok()?;
+    let mut spans = Vec::with_capacity(tokens.len());
+    let mut prev_end = 0usize;
+    for tok in &tokens {
+        let (from, to) = (tok.byte_start, tok.byte_end);
+        if from < prev_end
+            || from >= to
+            || to > run.len()
+            || !run.is_char_boundary(from)
+            || !run.is_char_boundary(to)
+        {
+            return None;
+        }
+        spans.push((from, to));
+        prev_end = to;
+    }
+    if spans.is_empty() { None } else { Some(spans) }
 }
 
 /// 混合分词器：汉字段走 jieba，非汉字段按字母数字切，全部小写归一。
@@ -59,6 +163,24 @@ impl MixedTokenizer {
                 offset_to: base + tok.offset_to,
                 position: *position,
                 text: tok.text.to_lowercase(),
+                position_length: 1,
+            });
+            *position += 1;
+        }
+    }
+
+    /// 한글 구간: lindera ko-dic으로 형태소를 나누고, run 안 byte 구간에 원문
+    /// base를 더해 정확한 offset을 만든다. token 텍스트는 lindera의 surface가
+    /// 아니라 원문 조각을 그대로 쓴다(정규화가 끼어들어도 offset과 어긋나지 않게).
+    /// lindera 결과가 검증을 통과하지 못하면 이 run만 어절 통째로 1 token으로 대체.
+    fn emit_hangul(run: &str, base: usize, out: &mut Vec<Token>, position: &mut usize) {
+        let spans = ko_spans(run).unwrap_or_else(|| vec![(0, run.len())]);
+        for (from, to) in spans {
+            out.push(Token {
+                offset_from: base + from,
+                offset_to: base + to,
+                position: *position,
+                text: run[from..to].to_lowercase(),
                 position_length: 1,
             });
             *position += 1;
@@ -97,6 +219,21 @@ impl MixedTokenizer {
             *position += 1;
         }
     }
+
+    fn emit_run(
+        &mut self,
+        kind: RunKind,
+        run: &str,
+        base: usize,
+        out: &mut Vec<Token>,
+        position: &mut usize,
+    ) {
+        match kind {
+            RunKind::Han => self.emit_cjk(run, base, out, position),
+            RunKind::Hangul => Self::emit_hangul(run, base, out, position),
+            RunKind::Other => Self::emit_non_cjk(run, base, out, position),
+        }
+    }
 }
 
 impl Tokenizer for MixedTokenizer {
@@ -111,31 +248,23 @@ impl Tokenizer for MixedTokenizer {
         // 顺序计数器，每产一个 token +1，跟 run 类型/跨了几个字无关——tantivy
         // 的短语查询要求相邻词位置差 1，不能用 jieba 的段内字符偏移。
         let mut run_start = 0usize;
-        let mut run_is_cjk: Option<bool> = None;
+        let mut run_kind_cur: Option<RunKind> = None;
         for (idx, ch) in text.char_indices() {
-            let cjk = is_jieba_han(ch);
-            match run_is_cjk {
-                None => run_is_cjk = Some(cjk),
-                Some(prev) if prev != cjk => {
+            let kind = run_kind(ch);
+            match run_kind_cur {
+                None => run_kind_cur = Some(kind),
+                Some(prev) if prev != kind => {
                     let run = &text[run_start..idx];
-                    if prev {
-                        self.emit_cjk(run, run_start, &mut tokens, &mut position);
-                    } else {
-                        Self::emit_non_cjk(run, run_start, &mut tokens, &mut position);
-                    }
+                    self.emit_run(prev, run, run_start, &mut tokens, &mut position);
                     run_start = idx;
-                    run_is_cjk = Some(cjk);
+                    run_kind_cur = Some(kind);
                 }
                 _ => {}
             }
         }
-        if let Some(prev) = run_is_cjk {
+        if let Some(prev) = run_kind_cur {
             let run = &text[run_start..];
-            if prev {
-                self.emit_cjk(run, run_start, &mut tokens, &mut position);
-            } else {
-                Self::emit_non_cjk(run, run_start, &mut tokens, &mut position);
-            }
+            self.emit_run(prev, run, run_start, &mut tokens, &mut position);
         }
 
         VecTokenStream { tokens, index: 0 }
@@ -418,6 +547,84 @@ mod tests {
         );
         assert!(tokens[..9].iter().all(|token| token.position == 0));
         assert!(tokens[9..].iter().all(|token| token.position == 1));
+    }
+
+    /// 모든 token에 대해 offset이 원문 조각과 정확히 일치하고 position이 0부터 1씩 증가하는지.
+    fn assert_offsets_and_positions(text: &str, tokens: &[Token]) {
+        for (i, t) in tokens.iter().enumerate() {
+            assert_eq!(t.position, i, "position은 1씩 증가해야 함: {tokens:?}");
+            assert_eq!(t.position_length, 1);
+            assert_eq!(
+                text[t.offset_from..t.offset_to].to_lowercase(),
+                t.text,
+                "offset이 원문 byte 위치와 어긋남: {t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hangul_eojeol_is_split_into_morphemes() {
+        let text = "배터리팩의";
+        let tokens = collect(text);
+        let texts: Vec<&str> = tokens.iter().map(|t| t.text.as_str()).collect();
+        assert!(texts.len() >= 2, "어절이 형태소로 나뉘어야 함: {texts:?}");
+        assert_eq!(texts.first(), Some(&"배터리"), "{texts:?}");
+        assert_eq!(texts.last(), Some(&"의"), "조사가 분리돼야 함: {texts:?}");
+        assert_eq!(texts.concat(), text, "형태소를 이어 붙이면 원래 어절");
+        assert_offsets_and_positions(text, &tokens);
+    }
+
+    #[test]
+    fn hangul_query_term_matches_indexed_morpheme() {
+        // 검색어 "배터리"와 색인된 "배터리팩의"가 같은 token을 공유해야 주 필드에서 맞는다.
+        let query: Vec<String> = collect("배터리").into_iter().map(|t| t.text).collect();
+        assert_eq!(query, vec!["배터리"]);
+        let doc: Vec<String> = collect("배터리팩의 수명")
+            .into_iter()
+            .map(|t| t.text)
+            .collect();
+        assert!(doc.contains(&"배터리".to_string()), "{doc:?}");
+    }
+
+    #[test]
+    fn mixed_korean_latin_han_offsets_are_exact_bytes() {
+        let text = "SMP가 계통한계가격(報告)을 결정한다. API-2026 테스트";
+        let tokens = collect(text);
+        assert_offsets_and_positions(text, &tokens);
+        let texts: Vec<&str> = tokens.iter().map(|t| t.text.as_str()).collect();
+        assert!(texts.contains(&"smp"), "{texts:?}");
+        assert!(texts.contains(&"가"), "{texts:?}");
+        assert!(texts.contains(&"api"), "{texts:?}");
+        assert!(texts.contains(&"2026"), "{texts:?}");
+        // 한글 token은 공백·라틴·한자 경계를 넘지 않는다.
+        for t in &tokens {
+            let s = &text[t.offset_from..t.offset_to];
+            if s.chars().any(is_hangul) {
+                assert!(
+                    s.chars().all(is_hangul),
+                    "한글 token이 run 경계를 넘음: {s:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hangul_compat_jamo_and_long_text_do_not_panic() {
+        let text = "ㅋㅋㅋ ㄱㄴㄷ 한국어 형태소 분석기 ".repeat(2_000);
+        let tokens = collect(&text);
+        assert!(!tokens.is_empty());
+        assert_offsets_and_positions(&text, &tokens);
+    }
+
+    #[test]
+    fn ko_spans_cover_run_without_gaps_for_plain_words() {
+        let run = "급속충전";
+        let spans = ko_spans(run).expect("ko-dic 사전이 로딩돼야 함");
+        assert_eq!(spans.first().map(|s| s.0), Some(0));
+        assert_eq!(spans.last().map(|s| s.1), Some(run.len()));
+        for w in spans.windows(2) {
+            assert!(w[0].1 <= w[1].0);
+        }
     }
 
     #[test]

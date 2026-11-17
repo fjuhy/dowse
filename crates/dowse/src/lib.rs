@@ -118,6 +118,7 @@ pub use searcher::{
     IndexedContentChunk, PreviewHit, SearchHit, SearchPage, Searcher, SortMode, normalize_ranges,
 };
 pub use status::{IndexStatus, index_status};
+pub use tokenizer::korean_morphology_available;
 pub use updater::{BatchOutcome, IndexUpdater};
 pub use volume::ntfs_fast_path_available;
 pub use watch::{

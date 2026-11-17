@@ -20,6 +20,11 @@ categories = ["command-line-utilities", "text-processing", "filesystem"]
 [features]
 default = ["cli"]
 cli = ["dep:clap", "dep:ctrlc", "dep:directories", "dep:rmcp", "dep:schemars", "dep:tokio"]
+# 한국어 형태소 사전(ko-dic, 컴파일 후 약 82MB)을 바이너리에 내장한다. 기본은 꺼짐:
+# 설치 파일 예산(<50MB) 때문에 배포본은 사전을 실행 파일 옆 `ko-dic/` 디렉터리
+# (또는 DOWSE_KO_DIC 환경 변수가 가리키는 곳)에 따로 두고, 처음 한글을 만났을 때
+# lazy 로딩한다. 사전이 없으면 한글은 형태소 분석 없이 어절 단위로 색인된다.
+embed-ko-dic = ["lindera/embed-ko-dic"]
 
 [[bin]]
 name = "dowse"
@@ -30,6 +35,7 @@ required-features = ["cli"]
 anyhow.workspace = true
 chardetng = "1.0.0"
 encoding_rs = "0.8.35"
+lindera = { version = "6.2.0", default-features = false, features = ["mmap"] }
 notify = "8.2.0"
 pdf-extract = "0.12.0"
 quick-xml = "0.41.0"
@@ -51,6 +57,9 @@ schemars = { version = "1.2.1", optional = true }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "io-std"], optional = true }
 
 [dev-dependencies]
+# 테스트에서만 ko-dic을 내장해 사전 파일 배치 없이 형태소 분석 경로를 검증한다
+# (resolver 2라 dev-dependency의 feature는 일반 release 빌드에 섞이지 않음).
+lindera = { version = "6.2.0", default-features = false, features = ["mmap", "embed-ko-dic"] }
 rmcp = { version = "3.0.1", features = ["client", "transport-child-process"] }
 tempfile = "3.27.0"
 
