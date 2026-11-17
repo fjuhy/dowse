@@ -85,8 +85,8 @@ export type ExtGroup = 'all' | 'doc' | 'code' | 'image';
 export type SortOption = 'relevance' | 'mtime_desc' | 'mtime_asc' | 'size_desc';
 
 /// 界面语言覆盖，跟 Rust 侧 `config.rs::AppConfig::lang` 一一对应：
-/// 'auto' 跟随系统，'zh'/'en' 钉死为中/英。见 i18n.ts 顶部的启动镜像说明。
-export type LangOption = 'auto' | 'zh' | 'en';
+/// 'auto' 跟随系统，'zh'/'en'/'ko' 钉死为中/英/韩。见 i18n.ts 顶部的启动镜像说明。
+export type LangOption = 'auto' | 'zh' | 'en' | 'ko';
 
 /// 设置面板通用区一次拉齐的初值，跟 Rust 侧 `commands.rs::SettingsDto`
 /// 一一对应。`autostart_enabled` 是自启插件报告的真实系统态（不是 config 里

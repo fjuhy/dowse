@@ -1,22 +1,31 @@
-// 界面中英双语字典。根布局先读取 config.lang，再挂载页面；设置修改仍在重启后生效。
+// 界面中/英/韩三语字典。根布局先读取 config.lang，再挂载页面；设置修改仍在重启后生效。
 // localStorage 仅作为读取配置失败时的启动兜底，不覆盖后端的权威设置。
 import type { LangOption } from './types';
 
 export const LANG_OVERRIDE_KEY = 'dowse.lang-override';
 
-function resolveIsZh(): boolean {
-	let override: string | null = null;
-	try {
-		override = localStorage.getItem(LANG_OVERRIDE_KEY);
-	} catch {
-		// localStorage 不可用（隐私模式等）就当没有覆盖，回落系统语言。
-	}
-	if (override === 'zh') return true;
-	if (override === 'en') return false;
-	return navigator.language.toLowerCase().startsWith('zh');
+type UiLang = 'zh' | 'en' | 'ko';
+
+// 'auto'（或未知取值）跟随系统语言：zh* → 中文，ko* → 한국어，其余英文。
+function resolveUiLang(pref: string | null): UiLang {
+	if (pref === 'zh' || pref === 'en' || pref === 'ko') return pref;
+	const sys = navigator.language.toLowerCase();
+	if (sys.startsWith('zh')) return 'zh';
+	if (sys.startsWith('ko')) return 'ko';
+	return 'en';
 }
 
-export let isZh = resolveIsZh();
+function readOverride(): string | null {
+	try {
+		return localStorage.getItem(LANG_OVERRIDE_KEY);
+	} catch {
+		// localStorage 不可用（隐私模式等）就当没有覆盖，回落系统语言。
+		return null;
+	}
+}
+
+let uiLang: UiLang = resolveUiLang(readOverride());
+export let isZh = uiLang === 'zh';
 
 interface Strings {
 	// 类型筛选下拉
@@ -138,6 +147,7 @@ interface Strings {
 	setLangAuto: string;
 	setLangZh: string;
 	setLangEn: string;
+	setLangKo: string;
 	setLangRestartHint: string;
 	// 通用区 - 开/关两态（开机自启）
 	setOn: string;
@@ -260,6 +270,7 @@ const zh: Strings = {
 	setLangAuto: '跟随系统',
 	setLangZh: '中文',
 	setLangEn: 'English',
+	setLangKo: '한국어',
 	setLangRestartHint: '重启后生效。',
 	setOn: '开',
 	setOff: '关',
@@ -380,6 +391,7 @@ const en: Strings = {
 	setLangAuto: 'System',
 	setLangZh: '中文',
 	setLangEn: 'English',
+	setLangKo: '한국어',
 	setLangRestartHint: 'Takes effect after restart.',
 	setOn: 'On',
 	setOff: 'Off',
@@ -401,12 +413,137 @@ const en: Strings = {
 	rpRebuildNoIndexHint: 'No index folder yet — add one from the empty state or the tray menu first.'
 };
 
-export let t: Strings = isZh ? zh : en;
+const ko: Strings = {
+	filterAll: '전체',
+	filterDoc: '문서',
+	filterCode: '코드',
+	filterImage: '이미지',
+	filterIdleLabel: '모든 형식',
+	sortRelevance: '관련도순',
+	sortNewest: '최신순',
+	sortOldest: '오래된순',
+	sortLargest: '큰 파일순',
+	sortIdleLabel: '관련도순',
+	searchPlaceholder: '파일 이름이나 내용 검색…',
+	resultsPrefix: '결과 · ',
+	resultsSuffix: '건',
+	previousPage: '이전 페이지',
+	nextPage: '다음 페이지',
+	pageStatus: (page, total) => `${total}페이지 중 ${page}페이지`,
+	dialogPickIndexFolder: '색인할 폴더 선택',
+	dialogAddFolder: '추가할 폴더 선택',
+	toastOpenFailed: (err) => `파일을 열지 못했습니다: ${err}`,
+	toastRevealFailed: (err) => `폴더를 열지 못했습니다: ${err}`,
+	toastPathCopied: '경로를 복사했습니다.',
+	toastCopyFailed: '복사하지 못했습니다.',
+	toastRebuildDone: (n) => `색인을 다시 만들었습니다. 파일 ${n}개를 색인했습니다.`,
+	toastRebuildFailed: (err) => `색인을 다시 만들지 못했습니다: ${err}`,
+	toastFolderRemoved: (n) => `폴더를 제거했습니다. 문서 ${n}개를 색인에서 뺐습니다.`,
+	ocrProgressLabel: '이미지 글자 인식',
+	previewSelectHint: '결과를 선택하면 여기에 미리 보기가 표시됩니다.',
+	ocrLoading: '인식한 글자를 불러오는 중…',
+	ocrCaption: '이미지 속 글자 (OCR)',
+	imageViewer: '이미지 보기',
+	closeImageViewer: '미리 보기로 돌아가기',
+	imageFit: '창에 맞추기',
+	imageFitWidth: '너비에 맞추기',
+	imageZoomIn: '확대',
+	imageZoomOut: '축소',
+	imageLoadFailed: '이미지를 불러오지 못했습니다',
+	imageEnlarge: '크게 보기',
+
+	ocrEmpty: '인식된 글자가 없거나 아직 백그라운드에서 처리를 기다리는 중입니다.',
+	previewLoading: '불러오는 중…',
+	previewEmpty: '미리 볼 수 있는 텍스트가 없습니다.',
+	resizePreviewPane: '결과 영역과 미리 보기 영역 너비 조절',
+	resultListLabel: '검색 결과',
+	pinUnpin: '고정 해제 (다른 창을 누르면 다시 자동으로 숨김)',
+	pin: '고정 (다른 창을 눌러도 숨기지 않음)',
+	scHide: '숨기기',
+	scCopyPath: '경로 복사',
+	scReveal: '파일 탐색기에서 보기',
+	scOpen: '열기',
+	esTypeToSearch: '입력하면 바로 검색합니다.',
+	esSearchHelp: '파일 이름과 문서 내용을 검색합니다. 여러 단어를 입력하면 모두 포함된 결과를 찾고, "따옴표"로 묶으면 구문 그대로 검색합니다.',
+	esAddFolder: '폴더 추가',
+	esNoIndexTitle: '아직 색인이 없습니다.',
+	esNoIndexSub: '폴더를 선택해 색인을 시작하세요. 나중에 트레이 메뉴에서 다시 만들 수 있습니다.',
+	esPickAndIndex: '폴더 선택하고 색인하기',
+	esCountUnit: '개 문서',
+	esErrorTitle: '색인 작업에 실패했습니다.',
+	esUnknownError: '알 수 없는 오류입니다.',
+	esRepick: '다른 폴더 선택',
+	esNoMatch: (numDocs) => `일치하는 결과가 없습니다. 색인에 문서 ${numDocs}개가 있습니다.`,
+	esNoMatchSub: '다른 검색어를 입력하거나, 파일이 색인된 폴더에 있는지 확인하세요.',
+	esSkippedOversize: (n) => `이 중 ${n}개는 크기 제한을 넘어 건너뛰었습니다.`,
+	historyTitle: '최근 검색',
+	historyClear: '지우기',
+	historyLabel: '최근 검색 목록',
+	formatSeconds: (seconds) => (seconds < 10 ? `${seconds.toFixed(1)}초` : `${Math.round(seconds)}초`),
+	indexReport: (indexed, seconds) => `문서 ${indexed}개, ${seconds}.`,
+	soCardTitle: '단축키',
+	soScrimLabel: '단축키 안내 닫기 (아무 키나 누르거나 클릭)',
+	soDialogLabel: '단축키 안내',
+	soShow: '불러오기',
+	soHide: '숨기기',
+	soNavigate: '이동',
+	soOpen: '열기',
+	soRevealFolder: '폴더로 이동',
+	soCopyPath: '경로 복사',
+	soFilterType: '형식 필터',
+	soSort: '정렬',
+	soPin: '고정',
+	soCheatSheet: '단축키 안내',
+	soSettings: '설정',
+	setTitle: '설정',
+	setCloseLabel: '설정 닫기',
+	setTabGeneral: '일반',
+	setTabRules: '색인 규칙',
+	setHotkeyLabel: '불러오기 단축키',
+	setHotkeyHint: '보조 키(Ctrl / Alt / Shift / Win)를 하나 이상 포함하고 주 키를 하나 더해야 합니다.',
+	setHotkeyChange: '변경',
+	setHotkeyCapturing: '새 키 조합을 누르세요… (Esc로 취소)',
+	setHotkeyConfirm: '확인',
+	setHotkeyCancel: '취소',
+	setHotkeyNeedModifier: '보조 키(Ctrl / Alt / Shift / Win)가 하나 이상 필요합니다.',
+	setHotkeySaved: '단축키를 변경했습니다.',
+	setHotkeyFailed: (err) => `단축키를 변경하지 못했습니다: ${err}`,
+	setAutostartLabel: '시작 시 자동 실행',
+	setLangLabel: '언어',
+	setLangAuto: '시스템 설정',
+	setLangZh: '中文',
+	setLangEn: 'English',
+	setLangKo: '한국어',
+	setLangRestartHint: '다시 시작하면 적용됩니다.',
+	setOn: '켬',
+	setOff: '끔',
+	rpTitle: '색인 규칙',
+	rpCloseLabel: '색인 규칙 닫기',
+	rpExcludeDirsLabel: '제외할 폴더',
+	rpExcludeDirsHint:
+		'폴더 이름을 쉼표나 줄바꿈으로 구분해 입력하세요 (예: node_modules, dist). 점(.)으로 시작하는 폴더는 항상 제외되므로 적지 않아도 됩니다.',
+	rpExtraExtsLabel: '추가 텍스트 확장자',
+	rpExtraExtsHint: '점 없이 쉼표로 구분해 입력하세요 (예: rst, adoc). 기본 목록을 대체하지 않고 더합니다.',
+	rpMaxFileMbLabel: '파일 크기 상한 (MB)',
+	rpSave: '저장',
+	rpSaving: '저장 중…',
+	rpSaved: '저장했습니다. 색인을 다시 만들어야 완전히 적용됩니다.',
+	rpSaveFailed: (err) => `저장하지 못했습니다: ${err}`,
+	rpLoadFailed: '규칙을 불러오지 못해 기본값을 표시합니다.',
+	rpRebuildNow: '지금 다시 만들기',
+	rpRebuildMultiRootHint: '색인 폴더가 여러 개 등록되어 있습니다. 트레이 메뉴에서 폴더별로 다시 만드세요.',
+	rpRebuildNoIndexHint: '아직 색인 폴더가 없습니다. 빈 화면이나 트레이 메뉴에서 먼저 폴더를 추가하세요.'
+};
+
+const DICTS: Record<UiLang, Strings> = { zh, en, ko };
+
+export let t: Strings = DICTS[uiLang];
 
 // 必须在页面组件创建前调用，避免组件初始化时捕获旧语言。
 export function initializeLanguage(lang: LangOption): void {
-	isZh = lang === 'zh' || (lang === 'auto' && navigator.language.toLowerCase().startsWith('zh'));
-	t = isZh ? zh : en;
+	uiLang = resolveUiLang(lang);
+	isZh = uiLang === 'zh';
+	t = DICTS[uiLang];
 	try {
 		localStorage.setItem(LANG_OVERRIDE_KEY, lang);
 	} catch {
