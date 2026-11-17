@@ -218,6 +218,21 @@ fn extract_tagged_text(xml: &[u8], text_tag: &[u8], para_tag: Option<&[u8]>) -> 
                     out.push_str(&unescaped);
                 }
             }
+            // quick-xml 0.38 起，`&amp;` / `&#54637;` 这类实体与字符引用不再并进
+            // Text 事件，而是单独作为 GeneralRef 事件抛出。不处理的话 `R&D` 会变成
+            // `RD`，而 openpyxl 等工具把非 ASCII 字符一律写成数字字符引用时，
+            // 整格的中文/韩文正文会全部丢失。
+            Ok(Event::GeneralRef(r)) => {
+                if in_text {
+                    if let Ok(Some(ch)) = r.resolve_char_ref() {
+                        out.push(ch);
+                    } else if let Ok(name) = r.decode()
+                        && let Some(s) = quick_xml::escape::resolve_predefined_entity(&name)
+                    {
+                        out.push_str(s);
+                    }
+                }
+            }
             Ok(Event::End(e)) => {
                 let name = e.local_name();
                 if name.as_ref() == text_tag {
@@ -327,6 +342,39 @@ mod tests {
         let text = extract_text(&path).expect("xlsx 应能抽出文本");
         assert!(text.contains("季度对账哨兵词"));
         assert!(text.contains("quarterly-sentinel"));
+    }
+
+    /// openpyxl 写内联字符串时把非 ASCII 字符全部转成数字字符引用；
+    /// 预定义实体（`&amp;` 等）在任何 Office 文件里都很常见。两者都必须还原。
+    #[test]
+    fn xlsx_numeric_char_refs_and_entities_are_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("refs.xlsx");
+        let sheet1 = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1">
+      <c r="A1" t="inlineStr"><is><t>&#45257;&#44033;&#49688;&#50728;&#46020;</t></is></c>
+      <c r="B1" t="inlineStr"><is><t>R&amp;D &lt;x&gt; &#x41;</t></is></c>
+    </row>
+  </sheetData>
+</worksheet>"#;
+        write_zip(&path, &[("xl/worksheets/sheet1.xml", sheet1)]);
+
+        let text = extract_text(&path).expect("xlsx 应能抽出文本");
+        assert!(text.contains("냉각수온도"), "数字字符引用应还原: {text:?}");
+        assert!(text.contains("R&D <x> A"), "预定义实体应还原: {text:?}");
+    }
+
+    #[test]
+    fn docx_entities_inside_text_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("refs.docx");
+        let document_xml = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>R&amp;D 배터리&#54057;</w:t></w:r></w:p></w:body></w:document>"#;
+        write_zip(&path, &[("word/document.xml", document_xml)]);
+
+        let text = extract_text(&path).expect("docx 应能抽出文本");
+        assert_eq!(text, "R&D 배터리팩");
     }
 
     #[test]
