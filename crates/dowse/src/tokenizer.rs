@@ -68,7 +68,8 @@ pub(crate) const KO_DIC_ENV: &str = "DOWSE_KO_DIC";
 pub(crate) const KO_DIC_DIR_NAME: &str = "ko-dic";
 
 /// ko-dic 사전 후보 위치. 순서: `DOWSE_KO_DIC` → 실행 파일 옆 `ko-dic/` →
-/// 바이너리에 내장된 사전(`embed-ko-dic` feature로 빌드했을 때만 존재).
+/// macOS .app 번들의 `Contents/Resources/ko-dic/` → 바이너리에 내장된 사전
+/// (`embed-ko-dic` feature로 빌드했을 때만 존재).
 ///
 /// 사전을 기본으로 내장하지 않는 이유: 컴파일된 ko-dic은 약 82MB이고 설치 파일에는
 /// 앱과 CLI sidecar가 둘 다 들어가 엔진이 두 번 링크된다. 내장하면 release CLI가
@@ -79,14 +80,36 @@ fn ko_dic_candidates() -> Vec<String> {
     if let Some(dir) = std::env::var_os(KO_DIC_ENV).filter(|v| !v.is_empty()) {
         out.push(dir.to_string_lossy().into_owned());
     }
-    if let Some(exe_dir) = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join(KO_DIC_DIR_NAME)))
-        && exe_dir.join("metadata.json").is_file()
-    {
-        out.push(exe_dir.to_string_lossy().into_owned());
+    if let Ok(exe) = std::env::current_exe() {
+        out.extend(
+            ko_dic_dirs_for_exe(&exe)
+                .into_iter()
+                .filter(|dir| dir.join("metadata.json").is_file())
+                .map(|dir| dir.to_string_lossy().into_owned()),
+        );
     }
     out.push("embedded://ko-dic".to_string());
+    out
+}
+
+/// 실행 파일 위치로부터 ko-dic 디렉터리 후보를 우선순위대로 돌려준다(존재 여부는
+/// 보지 않음). 1) 실행 파일 옆 `ko-dic/` — Windows 설치본과 개발 빌드.
+/// 2) 실행 파일이 `<X>.app/Contents/MacOS/` 안에 있으면 `Contents/Resources/ko-dic/`
+/// — Tauri는 macOS에서 bundle resources를 실행 파일 옆이 아니라 Resources에 넣는다.
+/// 앱과 CLI sidecar가 둘 다 `Contents/MacOS/`에 있으므로 한 벌을 같이 쓴다.
+/// 판별은 디렉터리 배치(`Contents/MacOS`)로만 하므로 플랫폼과 무관하게 시험할 수 있다.
+fn ko_dic_dirs_for_exe(exe: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let Some(exe_dir) = exe.parent() else {
+        return out;
+    };
+    out.push(exe_dir.join(KO_DIC_DIR_NAME));
+    if exe_dir.file_name().is_some_and(|n| n == "MacOS")
+        && let Some(contents) = exe_dir.parent()
+        && contents.file_name().is_some_and(|n| n == "Contents")
+    {
+        out.push(contents.join("Resources").join(KO_DIC_DIR_NAME));
+    }
     out
 }
 
@@ -625,6 +648,35 @@ mod tests {
         for w in spans.windows(2) {
             assert!(w[0].1 <= w[1].0);
         }
+    }
+
+    #[test]
+    fn ko_dic_dirs_for_plain_exe_is_only_next_to_exe() {
+        let base = std::path::Path::new("/opt/dowse");
+        let dirs = ko_dic_dirs_for_exe(&base.join("dowse"));
+        assert_eq!(dirs, vec![base.join("ko-dic")]);
+    }
+
+    #[test]
+    fn ko_dic_dirs_for_macos_app_bundle_add_resources_after_exe_dir() {
+        let contents = std::path::Path::new("/Applications/dowse.app/Contents");
+        for exe in ["dowse-app", "dowse"] {
+            let dirs = ko_dic_dirs_for_exe(&contents.join("MacOS").join(exe));
+            assert_eq!(
+                dirs,
+                vec![
+                    contents.join("MacOS").join("ko-dic"),
+                    contents.join("Resources").join("ko-dic"),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn ko_dic_dirs_need_both_contents_and_macos_names() {
+        // `MacOS` 폴더라도 상위가 `Contents`가 아니면 번들로 보지 않는다.
+        let dirs = ko_dic_dirs_for_exe(std::path::Path::new("/tmp/MacOS/dowse"));
+        assert_eq!(dirs, vec![std::path::PathBuf::from("/tmp/MacOS/ko-dic")]);
     }
 
     #[test]
