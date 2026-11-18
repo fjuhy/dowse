@@ -45,6 +45,10 @@ pub(crate) fn is_extractable_with(path: &Path, rules: &IndexRules) -> bool {
 /// 调用方只需要知道"这个文件没有文本"，跳过即可。
 ///
 /// 体积上限和追加文本扩展名取自进程级当前生效规则（见 `rules` 模块）。
+///
+/// 색인 경로는 [`extract_document`]로 옮겨 가서 지금은 테스트에서만 쓴다
+/// (테스트 밖에서는 dead_code → Windows CI의 `clippy -D warnings` 실패).
+#[cfg(test)]
 pub fn extract_text(path: &Path) -> Option<String> {
     extract_text_with(path, &crate::rules::active_rules())
 }
@@ -70,13 +74,14 @@ pub(crate) struct ExtractedDoc {
     pub props: DocProps,
 }
 
-/// [`extract_text`]와 같은 규칙·같은 panic 방어로 본문과 문서 속성을 함께 뽑는다.
+/// 현재 적용 중인 색인 규칙과 같은 panic 방어로 본문과 문서 속성을 함께 뽑는다.
 pub(crate) fn extract_document(path: &Path) -> Option<ExtractedDoc> {
     extract_document_with(path, &crate::rules::active_rules())
 }
 
 /// [`extract_text`] 的纯函数版：体积上限、追加扩展名都从显式规则读，不碰进程级
 /// 全局，便于单测。零参的 `extract_text` 只是用当前生效规则调它。
+#[cfg(test)]
 fn extract_text_with(path: &Path, rules: &IndexRules) -> Option<String> {
     extract_document_with(path, rules).map(|doc| doc.text)
 }
@@ -182,8 +187,10 @@ fn pdf_props(doc: &pdf_extract::Document) -> DocProps {
 fn decode_pdf_text_string(bytes: &[u8]) -> String {
     if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
         let units: Vec<u16> = rest
-            .chunks_exact(2)
-            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&pair| u16::from_be_bytes(pair))
             .collect();
         return String::from_utf16_lossy(&units);
     }
