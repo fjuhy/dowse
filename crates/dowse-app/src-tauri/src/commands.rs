@@ -62,6 +62,16 @@ pub struct IndexStatusDto {
     pub roots: Vec<String>,
 }
 
+/// 한국어 형태소 사전(ko-dic) 유무가 색인할 때와 달라 다시 색인하는 게 좋은 폴더.
+/// `roots`가 비어 있으면 안내할 것이 없다(기록 없는 옛 색인 포함).
+#[derive(Serialize)]
+pub struct KoreanReindexHintDto {
+    /// 지금 ko-dic을 쓸 수 있는지(안내 문구를 "사전이 생김"/"사전이 없어짐"으로 가른다).
+    pub available: bool,
+    /// 다시 색인할 근, `dowse::display_path`로 정리한 표시용 경로.
+    pub roots: Vec<String>,
+}
+
 fn file_name_of(path: &str) -> String {
     Path::new(path)
         .file_name()
@@ -100,6 +110,24 @@ pub fn index_status(search: State<SearchState>) -> IndexStatusDto {
     IndexStatusDto {
         has_index,
         num_docs,
+        roots,
+    }
+}
+
+/// 화면 앱의 재색인 안내용. `index_status`와 따로 둔 이유: 처음 부를 때 ko-dic
+/// 사전을 열어(mmap) 시간이 걸릴 수 있어 async 명령으로 메인 스레드 밖에서 돈다.
+/// 색인이 없거나 meta를 못 읽으면 안내 없음(빈 목록).
+#[tauri::command]
+pub async fn korean_reindex_hint() -> KoreanReindexHintDto {
+    let roots = crate::config::index_dir()
+        .ok()
+        .and_then(|dir| dowse::korean_reindex_roots(&dir).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| dowse::display_path(&p.to_string_lossy()))
+        .collect();
+    KoreanReindexHintDto {
+        available: dowse::korean_morphology_available(),
         roots,
     }
 }

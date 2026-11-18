@@ -172,6 +172,12 @@ interface Strings {
 	propAuthor: string;
 	propCreated: string;
 	propModified: string;
+	/** ko-dic이 색인할 때는 없었는데 지금은 있음 → 재색인 권장 */
+	koReindexAvailable: string;
+	/** ko-dic이 색인할 때는 있었는데 지금은 없음 → 재색인 권장 */
+	koReindexMissing: string;
+	/** 폴더가 여러 개라 화면에서 바로 재색인할 수 없을 때, 아래 폴더 목록 앞에 붙는 안내 */
+	koReindexTrayHint: string;
 }
 
 const zh: Strings = {
@@ -296,7 +302,10 @@ const zh: Strings = {
 	propTitle: '标题',
 	propAuthor: '作者',
 	propCreated: '创建日期',
-	propModified: '修改日期'
+	propModified: '修改日期',
+	koReindexAvailable: '已找到韩语词典（ko-dic）。重建索引后，韩语搜索会更准确。',
+	koReindexMissing: '找不到韩语词典（ko-dic），与建索引时不一致，韩语搜索可能不准确。请重建索引。',
+	koReindexTrayHint: '请在托盘菜单“索引文件夹”里重建以下目录：'
 };
 
 const en: Strings = {
@@ -422,7 +431,10 @@ const en: Strings = {
 	propTitle: 'Title',
 	propAuthor: 'Author',
 	propCreated: 'Created',
-	propModified: 'Modified'
+	propModified: 'Modified',
+	koReindexAvailable: 'The Korean dictionary (ko-dic) is now available. Rebuild the index for more accurate Korean search.',
+	koReindexMissing: 'The Korean dictionary (ko-dic) is missing but the index was built with it, so Korean search may be inaccurate. Rebuild the index.',
+	koReindexTrayHint: 'Rebuild these folders from Indexed folders in the tray menu:'
 };
 
 const ko: Strings = {
@@ -548,7 +560,10 @@ const ko: Strings = {
 	propTitle: '제목',
 	propAuthor: '작성자',
 	propCreated: '작성일',
-	propModified: '수정일'
+	propModified: '수정일',
+	koReindexAvailable: '한국어 형태소 사전(ko-dic)을 찾았습니다. 색인을 다시 만들면 한국어 검색이 더 정확해집니다.',
+	koReindexMissing: '한국어 형태소 사전(ko-dic)을 찾을 수 없습니다. 색인을 만들 때와 달라 한국어 검색이 부정확할 수 있으니 색인을 다시 만드세요.',
+	koReindexTrayHint: '트레이 메뉴의 색인 폴더에서 아래 폴더를 다시 만드세요:'
 };
 
 const DICTS: Record<UiLang, Strings> = { zh, en, ko };

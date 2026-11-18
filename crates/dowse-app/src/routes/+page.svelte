@@ -11,6 +11,7 @@
 		IndexingPhase,
 		IndexingSnapshot,
 		IndexProgress,
+		KoreanReindexHint,
 		SearchHit,
 		SortOption,
 		TextSegment
@@ -30,6 +31,7 @@
 	import { t } from '$lib/i18n';
 	import { loadHistory, recordHistory, removeHistoryEntry, clearHistory } from '$lib/searchHistory';
 	import { reduceIndexingView } from '$lib/indexingState';
+	import { koReindexNotice } from '$lib/koReindex.js';
 	import {
 		SEARCH_PAGE_SIZE,
 		clampPageIndex,
@@ -70,6 +72,9 @@
 	let numDocs = $state(0);
 	/** 已注册的全部索引根（已过 display_path 清洗），空态逐行列出。 */
 	let roots = $state<string[]>([]);
+	/** 한국어 사전(ko-dic) 재색인 안내 원본(`korean_reindex_hint`). */
+	let koReindex = $state<KoreanReindexHint | null>(null);
+	let koNotice = $derived(koReindexNotice(koReindex, roots));
 	let previewSegments = $state<TextSegment[] | null>(null);
 	let previewLoading = $state(false);
 	let rebuildState = $state<'idle' | 'rebuilding' | 'error'>('idle');
@@ -185,6 +190,11 @@
 			numDocs = 0;
 			roots = [];
 		}
+		// 처음 부를 때 ko-dic 사전을 열 수 있어 기다리지 않는다(안내는 늦게 떠도 된다).
+		api
+			.koreanReindexHint()
+			.then((hint) => (koReindex = hint))
+			.catch(() => (koReindex = null));
 	}
 
 	/// OCR 队列进度的归一化更新：`pending` 是队列里还剩多少张待处理，跟
@@ -1033,6 +1043,8 @@
 				onselecthistory={selectHistoryEntry}
 				onhoverhistory={(i) => (historyIndex = i)}
 				onclearhistory={clearAllHistory}
+				{koNotice}
+				onrebuild={rebuildCurrentIndex}
 			/>
 		{:else}
 			<div class="results">

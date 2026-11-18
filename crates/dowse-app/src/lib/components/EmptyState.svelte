@@ -34,7 +34,9 @@
 		onaddfolder,
 		onselecthistory,
 		onhoverhistory,
-		onclearhistory
+		onclearhistory,
+		koNotice = null,
+		onrebuild
 	}: {
 		kind: Kind;
 		query: string;
@@ -53,6 +55,10 @@
 		onselecthistory?: (query: string) => void;
 		onhoverhistory?: (index: number) => void;
 		onclearhistory?: () => void;
+		/** 한국어 사전(ko-dic) 재색인 안내(`koReindexNotice` 결과). null이면 표시 안 함. */
+		koNotice?: { kind: 'available' | 'missing'; roots: string[]; canRebuildHere: boolean } | null;
+		/** 등록 폴더가 하나일 때 안내의 "지금 다시 만들기" 버튼. */
+		onrebuild?: () => void;
 	} = $props();
 
 	// "37 秒" 这种整数量级用四舍五入；不到 10 秒时留一位小数——冒烟测试用的
@@ -97,6 +103,21 @@
 			{#if onaddfolder}
 				<button type="button" class="link" onclick={onaddfolder}>{t.esAddFolder}</button>
 			{/if}
+		{/if}
+		{#if koNotice}
+			<div class="ko-notice" role="status">
+				<p class="sub">
+					{koNotice.kind === 'available' ? t.koReindexAvailable : t.koReindexMissing}
+				</p>
+				{#if koNotice.canRebuildHere && onrebuild}
+					<button type="button" class="link" onclick={onrebuild}>{t.rpRebuildNow}</button>
+				{:else}
+					<p class="sub">{t.koReindexTrayHint}</p>
+					{#each koNotice.roots as root (root)}
+						<p class="sub root-path mono">{middleEllipsis(root)}</p>
+					{/each}
+				{/if}
+			</div>
 		{/if}
 	{:else if kind === 'no-index'}
 		<p class="title">{t.esNoIndexTitle}</p>
@@ -221,6 +242,17 @@
 	/* 空态"键入即搜"下面那行当前索引根路径，跟 .sub 同一档灰度，字号跟
 	   current-file 对齐（都是"次要路径信息"），等宽字体方便中段省略号
 	   跟路径分隔符区分开。 */
+	/* 한국어 사전 재색인 안내: 오류가 아니라 권장이라 경고색 없이 얇은 구분선만 둔다. */
+	.ko-notice {
+		margin-top: 8px;
+		padding-top: 10px;
+		border-top: 1px solid var(--panel-border);
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		gap: 4px;
+	}
+
 	.root-path {
 		font-size: 11px;
 		opacity: 0.75;

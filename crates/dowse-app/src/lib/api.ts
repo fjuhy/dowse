@@ -6,6 +6,7 @@ import type {
 	IndexRules,
 	IndexStats,
 	IndexStatus,
+	KoreanReindexHint,
 	LangOption,
 	PreviewResult,
 	SearchPage,
@@ -14,6 +15,11 @@ import type {
 
 export function indexStatus(): Promise<IndexStatus> {
 	return invoke('index_status');
+}
+
+/// ko-dic 유무가 색인할 때와 다른 폴더(재색인 안내용). 처음 부를 때 사전을 열 수 있다.
+export function koreanReindexHint(): Promise<KoreanReindexHint> {
+	return invoke('korean_reindex_hint');
 }
 
 /// 建索引进度的当前快照——窗口每次呼出都应该拉一次，跟事件流（

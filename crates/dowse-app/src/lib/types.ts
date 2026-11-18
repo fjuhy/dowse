@@ -70,6 +70,14 @@ export interface IndexStatus {
 	roots: string[];
 }
 
+/** `korean_reindex_hint` 명령 결과: ko-dic 유무가 색인할 때와 달라 다시 색인할 폴더. */
+export interface KoreanReindexHint {
+	/** 지금 ko-dic을 쓸 수 있는지. */
+	available: boolean;
+	/** 다시 색인할 폴더(display_path 정리됨). 비어 있으면 안내 없음. */
+	roots: string[];
+}
+
 /// 建索引进度阶段——跟 Rust 侧 `indexing_status.rs::IndexingPhase` 一一对应。
 export type IndexingPhase = 'idle' | 'text' | 'ocr';
 

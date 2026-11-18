@@ -122,6 +122,7 @@ pub fn run() {
         .manage(HotkeyPerfState::new())
         .invoke_handler(tauri::generate_handler![
             commands::index_status,
+            commands::korean_reindex_hint,
             commands::indexing_status,
             commands::search,
             commands::preview,
