@@ -186,3 +186,87 @@ fn office_and_pdf_properties_are_indexed_searchable_and_returned() -> Result<()>
     assert_eq!(txt.doc_created, None);
     Ok(())
 }
+
+#[test]
+fn author_and_title_operators_filter_by_document_properties() -> Result<()> {
+    force_slow_lane_for_tests();
+    let index_dir = tempfile::tempdir()?;
+    let target = target_dir();
+
+    let core = |title: &str, creator: &str| {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
+  xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>{title}</dc:title><dc:creator>{creator}</dc:creator></cp:coreProperties>"#
+        )
+    };
+    let body = |text: &str| {
+        format!(
+            r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:body></w:document>"#
+        )
+    };
+    // a.docx: 작성자 홍길동, 제목 "Quarterly Battery Report"
+    // b.docx: 작성자 Quarterly Kim(제목 단어가 작성자에 있음), 제목 "홍길동 인터뷰"(작성자 이름이 제목에 있음)
+    write_zip(
+        &target.path().join("a.docx"),
+        &[
+            ("word/document.xml", &body("shared sentinel alpha")),
+            (
+                "docProps/core.xml",
+                &core("Quarterly Battery Report", "홍길동"),
+            ),
+        ],
+    );
+    write_zip(
+        &target.path().join("b.docx"),
+        &[
+            ("word/document.xml", &body("shared sentinel beta")),
+            ("docProps/core.xml", &core("홍길동 인터뷰", "Quarterly Kim")),
+        ],
+    );
+    fs::write(
+        target.path().join("c.txt"),
+        "shared sentinel 홍길동 quarterly",
+    )?;
+
+    rebuild_index(index_dir.path(), target.path())?;
+
+    let names = |q: &str| {
+        let mut v: Vec<String> = hits(index_dir.path(), q)
+            .into_iter()
+            .map(|h| {
+                Path::new(&h.path)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        v.sort();
+        v
+    };
+
+    // 필드를 구분한다: author:홍길동은 작성자만, title:홍길동은 제목만.
+    assert_eq!(names("author:홍길동"), vec!["a.docx"]);
+    assert_eq!(names("title:홍길동"), vec!["b.docx"]);
+    // 대소문자 무시, 여러 토큰은 AND, 따옴표는 구문.
+    assert_eq!(names("title:quarterly"), vec!["a.docx"]);
+    assert_eq!(names("author:QUARTERLY"), vec!["b.docx"]);
+    assert_eq!(names("title:\"battery report\""), vec!["a.docx"]);
+    assert!(names("title:\"report battery\"").is_empty());
+    // 다른 연산자·내용어와 결합.
+    assert_eq!(names("sentinel author:홍길동"), vec!["a.docx"]);
+    assert_eq!(names("sentinel -author:홍길동"), vec!["b.docx", "c.txt"]);
+    assert_eq!(
+        names("author:홍길동 OR author:kim"),
+        vec!["a.docx", "b.docx"]
+    );
+    assert_eq!(names("title:battery mtime:>2000-01-01"), vec!["a.docx"]);
+    // 빈 피연산자는 오류.
+    assert!(
+        Searcher::open(index_dir.path())?
+            .search("author:", 10)
+            .is_err()
+    );
+    Ok(())
+}

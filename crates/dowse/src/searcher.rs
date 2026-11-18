@@ -682,6 +682,18 @@ impl Searcher {
             for path in &group.paths {
                 clauses.push((Occur::Must, self.build_path_query(path)?));
             }
+            for author in &group.authors {
+                clauses.push((
+                    Occur::Must,
+                    self.build_field_term_query(self.fields.author, "author", author)?,
+                ));
+            }
+            for title in &group.titles {
+                clauses.push((
+                    Occur::Must,
+                    self.build_field_term_query(self.fields.title, "title", title)?,
+                ));
+            }
             for bound in &group.mtimes {
                 clauses.push((Occur::Must, self.build_mtime_query(bound)));
             }
@@ -723,18 +735,27 @@ impl Searcher {
     /// 操作数（`path:"my docs"`）且切出多个 token 时按短语（相邻位置）匹配，落实
     /// "按整体处理"；否则多个 token 之间 AND、单 token 直接一个 TermQuery。
     fn build_path_query(&self, path: &query::PathTerm) -> Result<Box<dyn Query>> {
+        self.build_field_term_query(self.fields.path_text, "path", path)
+    }
+
+    /// `path:` / `author:` / `title:` 공용: 색인과 같은 MixedTokenizer로 피연산자를
+    /// 토큰화해 `field` 위의 쿼리를 만든다. 따옴표 + 여러 토큰이면 PhraseQuery,
+    /// 아니면 토큰 AND. author/title 필드도 "jieba"(MixedTokenizer) + 위치 색인이다.
+    fn build_field_term_query(
+        &self,
+        field: tantivy::schema::Field,
+        label: &str,
+        path: &query::PathTerm,
+    ) -> Result<Box<dyn Query>> {
         let mut tokenizer = crate::tokenizer::MixedTokenizer::new();
         let mut stream = tokenizer.token_stream(&path.operand);
         let mut terms: Vec<Term> = Vec::new();
         while stream.advance() {
-            terms.push(Term::from_field_text(
-                self.fields.path_text,
-                &stream.token().text,
-            ));
+            terms.push(Term::from_field_text(field, &stream.token().text));
         }
         if terms.is_empty() {
             bail!(
-                "path: 操作数 \"{}\" 里没有可检索的内容（全是标点/空白？）",
+                "{label}: 操作数 \"{}\" 里没有可检索的内容（全是标点/空白？）",
                 path.operand
             );
         }

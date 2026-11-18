@@ -40,7 +40,7 @@ const MAX_READ_CHARS: usize = 8_000;
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchParams {
     /// 查询词，支持空格分隔多个词（AND 语义）和 "短语查询"。也支持内联操作符：
-    /// `path:关键词`（按路径匹配）、`mtime:>2026-01-01`/`mtime:<=2026-07`（按修改
+    /// `path:关键词`（按路径匹配）、`author:作者`/`title:标题`（按文档属性）、`mtime:>2026-01-01`/`mtime:<=2026-07`（按修改
     /// 日期，支持 > >= < <=，日期写 YYYY-MM-DD 或 YYYY-MM）、`size:>10mb`/`size:<500kb`
     /// （按体积，单位 kb/mb/gb）、`A OR B`（大写 OR 分组，组内空格是 AND）、
     /// `-词` 或 `NOT 词`（排除）。带空格的操作数加引号，如 `path:"我的 文档"`
@@ -305,7 +305,7 @@ impl DowseMcpServer {
     }
 
     #[tool(
-        description = "在本地全文索引里搜索，返回命中列表；命中词用 «» 标出。查询串支持内联操作符：path:关键词（按路径）、mtime:>2026-01-01 / mtime:<=2026-07（按修改日期，比较符 > >= < <=，日期 YYYY-MM-DD 或 YYYY-MM）、size:>10mb / size:<500kb（按体积，单位 kb/mb/gb）、大写 OR 分组（组内空格为 AND）、-词 或 NOT 词 排除；带空格的操作数加引号如 path:\"我的 文档\"。默认按相关度排序，可用 sort 改按修改时间/体积排；ext 可按扩展名过滤（逗号分隔多个）；limit/offset 翻页，返回里的 total_hits 是匹配总数。先用这个工具定位候选文件，再用 preview 看更长的上下文。",
+        description = "在本地全文索引里搜索，返回命中列表；命中词用 «» 标出。查询串支持内联操作符：path:关键词（按路径）、author:作者 / title:标题（按文档属性的作者/标题）、mtime:>2026-01-01 / mtime:<=2026-07（按修改日期，比较符 > >= < <=，日期 YYYY-MM-DD 或 YYYY-MM）、size:>10mb / size:<500kb（按体积，单位 kb/mb/gb）、大写 OR 分组（组内空格为 AND）、-词 或 NOT 词 排除；带空格的操作数加引号如 path:\"我的 文档\"。默认按相关度排序，可用 sort 改按修改时间/体积排；ext 可按扩展名过滤（逗号分隔多个）；limit/offset 翻页，返回里的 total_hits 是匹配总数。先用这个工具定位候选文件，再用 preview 看更长的上下文。",
         output_schema = schema_for_output::<SearchOutput>(),
         annotations(title = "全文搜索", read_only_hint = true)
     )]

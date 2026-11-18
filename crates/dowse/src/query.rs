@@ -90,6 +90,10 @@ pub(crate) struct Group {
     pub excluded: Vec<String>,
     /// `path:` 路径过滤。
     pub paths: Vec<PathTerm>,
+    /// `author:` 문서 속성 작성자 필터. 피연산자 형식은 `path:`와 같다.
+    pub authors: Vec<PathTerm>,
+    /// `title:` 문서 속성 제목 필터. 피연산자 형식은 `path:`와 같다.
+    pub titles: Vec<PathTerm>,
     /// `mtime:` 时间过滤。
     pub mtimes: Vec<DateBound>,
     /// `size:` 体积过滤。
@@ -103,6 +107,8 @@ impl Group {
         self.content.is_empty()
             && self.excluded.is_empty()
             && self.paths.is_empty()
+            && self.authors.is_empty()
+            && self.titles.is_empty()
             && self.mtimes.is_empty()
             && self.sizes.is_empty()
     }
@@ -176,7 +182,8 @@ fn is_operator_token(token: &str) -> bool {
     }
     matches!(
         split_field(token),
-        Some((ref f, _)) if f == "path" || f == "mtime" || f == "size"
+        Some((ref f, _))
+            if f == "path" || f == "mtime" || f == "size" || f == "author" || f == "title"
     )
 }
 
@@ -271,6 +278,21 @@ fn classify_group(tokens: &[&str]) -> Result<Group> {
                         bail!("path: 后面要跟路径关键词，例如 `path:报告` 或 `path:\"我的 文档\"`");
                     }
                     g.paths.push(PathTerm { operand, phrase });
+                    continue;
+                }
+                "author" | "title" => {
+                    let (operand, phrase) = unquote(rest);
+                    if operand.trim().is_empty() {
+                        bail!(
+                            "{field}: 뒤에 검색어가 필요합니다. 예: `{field}:홍길동` 또는 `{field}:\"분기 보고서\"`"
+                        );
+                    }
+                    let term = PathTerm { operand, phrase };
+                    if field == "author" {
+                        g.authors.push(term);
+                    } else {
+                        g.titles.push(term);
+                    }
                     continue;
                 }
                 "mtime" => {
@@ -569,6 +591,39 @@ mod tests {
         assert!(parsed.has_operators);
         assert_eq!(parsed.groups[0].content, vec!["ext:md"]);
         assert_eq!(parsed.groups[0].excluded, vec!["草稿"]);
+    }
+
+    #[test]
+    fn author_and_title_operators_are_recognized() {
+        let parsed = parse("author:홍길동").unwrap();
+        assert!(parsed.has_operators);
+        assert_eq!(
+            parsed.groups[0].authors,
+            vec![PathTerm {
+                operand: "홍길동".into(),
+                phrase: false
+            }]
+        );
+        assert!(parsed.groups[0].content.is_empty());
+
+        let parsed = parse("배터리 TITLE:\"분기 보고서\" -초안").unwrap();
+        let g = &parsed.groups[0];
+        assert_eq!(g.content, vec!["배터리"]);
+        assert_eq!(
+            g.titles,
+            vec![PathTerm {
+                operand: "분기 보고서".into(),
+                phrase: true
+            }]
+        );
+        assert_eq!(g.excluded, vec!["초안"]);
+
+        let parsed = parse("author:kim OR author:lee").unwrap();
+        assert_eq!(parsed.groups.len(), 2);
+        assert_eq!(parsed.groups[1].authors[0].operand, "lee");
+
+        assert!(parse("author:").is_err(), "author: 빈 피연산자는 오류");
+        assert!(parse("title:\"\"").is_err(), "title: 빈 따옴표는 오류");
     }
 
     #[test]
