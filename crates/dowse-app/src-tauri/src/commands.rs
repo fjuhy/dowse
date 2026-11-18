@@ -31,6 +31,12 @@ pub struct SearchHitDto {
     pub name_segments: Vec<TextSegment>,
     pub snippet_segments: Vec<TextSegment>,
     pub score: f32,
+    /// 문서 속성(schema v8): 작성자/제목. 없으면 null.
+    pub author: Option<String>,
+    pub title: Option<String>,
+    /// 문서 속성의 작성일/수정일(UTC 밀리초 Unix 타임스탬프). 없으면 null.
+    pub doc_created: Option<i64>,
+    pub doc_modified: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -149,6 +155,10 @@ pub fn search(
                 name_segments,
                 snippet_segments,
                 score: hit.score,
+                author: hit.author,
+                title: hit.title,
+                doc_created: hit.doc_created,
+                doc_modified: hit.doc_modified,
             }
         })
         .collect();

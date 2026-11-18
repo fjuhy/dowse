@@ -3,6 +3,7 @@
 	import { extOf } from '../fileKind';
 	import FileIcon from './FileIcon.svelte';
 	import Segments from './Segments.svelte';
+	import { docPropsLine } from '../docProps.js';
 
 	let {
 		hit,
@@ -38,6 +39,9 @@
 	// 行右侧的类型提示——Raycast 每行右边都挂一个与图标同层级的分类小字；
 	// 这里用扩展名（没有就不渲染，不留空占位）。
 	let typeLabel = $derived(extOf(hit.path).toUpperCase());
+
+	// 문서 속성 한 줄(제목 · 작성자 · 수정일). 속성 없는 파일은 렌더링하지 않는다.
+	let propsLine = $derived(docPropsLine(hit));
 </script>
 
 <button
@@ -53,6 +57,9 @@
 	<span class="row-text">
 		<span class="row-name"><Segments segments={hit.name_segments} /></span>
 		<span class="row-path">{dirOf}</span>
+		{#if propsLine}
+			<span class="row-props" title={propsLine}>{propsLine}</span>
+		{/if}
 		{#if hit.snippet_segments.length > 0}
 			<span class="row-snippet"><Segments segments={hit.snippet_segments} /></span>
 		{/if}
@@ -117,6 +124,15 @@
 
 	.row-path {
 		font-family: var(--font-mono);
+		font-size: 11px;
+		color: var(--fg-tertiary);
+		line-height: 1.3;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+
+	.row-props {
 		font-size: 11px;
 		color: var(--fg-tertiary);
 		line-height: 1.3;

@@ -7,6 +7,7 @@
 	import FileIcon from './FileIcon.svelte';
 	import Segments from './Segments.svelte';
 	import { t } from '../i18n';
+	import { docPropItems } from '../docProps.js';
 
 	let {
 		hit,
@@ -30,6 +31,7 @@
 	let imageSrc = $derived(hit && isImage ? convertFileSrc(hit.path) : null);
 	let viewer = $state<{ src: string; name: string } | null>(null);
 	let failedSrc = $state<string | null>(null);
+	let propItems = $derived(hit ? docPropItems(hit, t) : []);
 </script>
 
 <div class="preview">
@@ -41,6 +43,14 @@
 			<span class="name"><Segments segments={hit.name_segments} /></span>
 		</div>
 		<div class="path">{middleEllipsis(hit.display_path)}</div>
+		{#if propItems.length > 0}
+			<dl class="props">
+				{#each propItems as item (item.key)}
+					<dt>{item.label}</dt>
+					<dd title={item.value}>{item.value}</dd>
+				{/each}
+			</dl>
+		{/if}
 		<div class="body" class:image-body={isImage}>
 			{#if isImage}
 				{#if imageSrc}
@@ -93,6 +103,28 @@
 	.name {
 		font-size: 13.5px;
 		font-weight: 500;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+
+	.props {
+		display: grid;
+		grid-template-columns: max-content minmax(0, 1fr);
+		gap: 2px 10px;
+		margin: 0;
+		padding: 8px 0;
+		border-bottom: 1px solid var(--divider);
+		font-size: 11.5px;
+	}
+
+	.props dt {
+		color: var(--fg-tertiary);
+	}
+
+	.props dd {
+		margin: 0;
+		color: var(--fg-secondary);
 		white-space: nowrap;
 		overflow: hidden;
 		text-overflow: ellipsis;

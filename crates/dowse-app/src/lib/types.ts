@@ -16,6 +16,12 @@ export interface SearchHit {
 	name_segments: TextSegment[];
 	snippet_segments: TextSegment[];
 	score: number;
+	/** 문서 속성(작성자/제목). 없으면 null. */
+	author: string | null;
+	title: string | null;
+	/** 문서 속성의 작성일/수정일(UTC 밀리초 Unix 타임스탬프). 없으면 null. */
+	doc_created: number | null;
+	doc_modified: number | null;
 }
 
 export interface SearchPage {

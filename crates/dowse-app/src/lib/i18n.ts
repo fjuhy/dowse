@@ -168,6 +168,10 @@ interface Strings {
 	rpRebuildNow: string;
 	rpRebuildMultiRootHint: string;
 	rpRebuildNoIndexHint: string;
+	propTitle: string;
+	propAuthor: string;
+	propCreated: string;
+	propModified: string;
 }
 
 const zh: Strings = {
@@ -288,7 +292,11 @@ const zh: Strings = {
 	rpLoadFailed: '规则加载失败，已显示默认值。',
 	rpRebuildNow: '立即重建',
 	rpRebuildMultiRootHint: '已注册多个索引目录，请到托盘菜单里逐个重建。',
-	rpRebuildNoIndexHint: '还没有索引目录，先在空态或托盘菜单里添加一个文件夹。'
+	rpRebuildNoIndexHint: '还没有索引目录，先在空态或托盘菜单里添加一个文件夹。',
+	propTitle: '标题',
+	propAuthor: '作者',
+	propCreated: '创建日期',
+	propModified: '修改日期'
 };
 
 const en: Strings = {
@@ -410,7 +418,11 @@ const en: Strings = {
 	rpLoadFailed: 'Could not load rules; showing defaults.',
 	rpRebuildNow: 'Rebuild now',
 	rpRebuildMultiRootHint: 'Multiple index folders are registered; rebuild each one from the tray menu.',
-	rpRebuildNoIndexHint: 'No index folder yet — add one from the empty state or the tray menu first.'
+	rpRebuildNoIndexHint: 'No index folder yet — add one from the empty state or the tray menu first.',
+	propTitle: 'Title',
+	propAuthor: 'Author',
+	propCreated: 'Created',
+	propModified: 'Modified'
 };
 
 const ko: Strings = {
@@ -532,7 +544,11 @@ const ko: Strings = {
 	rpLoadFailed: '규칙을 불러오지 못해 기본값을 표시합니다.',
 	rpRebuildNow: '지금 다시 만들기',
 	rpRebuildMultiRootHint: '색인 폴더가 여러 개 등록되어 있습니다. 트레이 메뉴에서 폴더별로 다시 만드세요.',
-	rpRebuildNoIndexHint: '아직 색인 폴더가 없습니다. 빈 화면이나 트레이 메뉴에서 먼저 폴더를 추가하세요.'
+	rpRebuildNoIndexHint: '아직 색인 폴더가 없습니다. 빈 화면이나 트레이 메뉴에서 먼저 폴더를 추가하세요.',
+	propTitle: '제목',
+	propAuthor: '작성자',
+	propCreated: '작성일',
+	propModified: '수정일'
 };
 
 const DICTS: Record<UiLang, Strings> = { zh, en, ko };
