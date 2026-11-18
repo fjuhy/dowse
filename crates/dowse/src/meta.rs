@@ -3,7 +3,7 @@
 //! 前用 [`ensure_schema_version`] 校验版本，不匹配就报错提示重建，不做静默
 //! 迁移。[`registered_roots`] 是对外读根列表的入口。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -56,8 +56,26 @@ pub struct IndexMeta {
     /// 버전에 넣지 않는다: 사전 유무가 달라도 색인은 열리고 검색도 되지만(한글
     /// 토큰 경계만 달라짐), 현재 환경과 다르면 status에서 재색인을 안내한다.
     /// 이 필드가 생기기 전 meta.json은 `None`(알 수 없음).
+    /// [`Self::korean_morphology_roots`]에 항목이 없는 근은 이 값을 따른다.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub korean_morphology: Option<bool>,
+    /// 전체 재구축 이후 따로 (다시) 색인된 근(폴더 추가, 단일 근 재색인, 보충 색인)이
+    /// 그때 ko-dic을 썼는지. 키는 `roots`에 들어 있는 그대로의 경로. 다중 근 색인은
+    /// 근마다 따로 다시 색인할 수 있으므로, 근 단위로 기록해야 모든 근을 다시 색인한
+    /// 뒤 재색인 안내가 사라진다. 전체 재구축은 이 표를 비운다.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub korean_morphology_roots: BTreeMap<PathBuf, bool>,
+}
+
+impl IndexMeta {
+    /// 근 하나가 색인될 때 ko-dic을 썼는지(근별 기록 → 전체 재구축 기록 순). 알 수
+    /// 없으면 `None`.
+    pub(crate) fn korean_morphology_of(&self, root: &Path) -> Option<bool> {
+        self.korean_morphology_roots
+            .get(root)
+            .copied()
+            .or(self.korean_morphology)
+    }
 }
 
 /// meta.json 放在索引目录的**兄弟**位置（`<index_dir>-meta.json`），不是塞进
@@ -213,34 +231,11 @@ pub(crate) fn assert_no_root_nesting(existing: &[PathBuf], candidate: &Path) -> 
 pub(crate) fn append_root(index_dir: &Path, root: &Path) -> Result<()> {
     let mut meta = load_meta(index_dir)?;
     assert_no_root_nesting(&meta.roots, root)?;
-    meta.korean_morphology = korean_morphology_after_indexing_root(
-        meta.korean_morphology,
-        meta.roots.is_empty(),
-        crate::korean_morphology_available(),
-    );
+    // 이 근의 문서는 방금 현재 환경으로 색인됐다. 다른 근의 기록은 건드리지 않는다.
+    meta.korean_morphology_roots
+        .insert(root.to_path_buf(), crate::korean_morphology_available());
     meta.roots.push(root.to_path_buf());
     save_meta(index_dir, &meta)
-}
-
-/// 근 하나를 (다시) 색인한 뒤 meta의 `korean_morphology`를 어떻게 둘지 정한다.
-///
-/// - 그 근 말고 다른 근이 하나도 없으면 색인의 모든 문서가 방금 현재 환경으로
-///   색인된 것이므로 현재 값(`Some(available)`)으로 갱신한다(옛 meta의 `None`도 이때
-///   비로소 확정된다).
-/// - 다른 근이 남아 있으면 그 근들의 문서는 기록된 값으로 색인돼 있으므로 기록을
-///   그대로 둔다. 기록과 현재가 다르면 색인이 섞인 상태라 status의 불일치 안내
-///   (전체 재색인 권장)가 계속 뜨는 것이 맞고, 같으면 바뀔 것이 없다. 기록이 없는
-///   옛 색인(`None`)은 계속 알 수 없음으로 둔다.
-fn korean_morphology_after_indexing_root(
-    recorded: Option<bool>,
-    no_other_roots: bool,
-    available: bool,
-) -> Option<bool> {
-    if no_other_roots {
-        Some(available)
-    } else {
-        recorded
-    }
 }
 
 /// 候选根是否已经**精确**注册过（按 [`best_effort_normalize`] 归一后跟某个已有根
@@ -304,19 +299,20 @@ pub(crate) fn register_root_with_cursors(
     usn_cursors: HashMap<VolumeKey, UsnCursor>,
 ) -> Result<()> {
     let mut meta = load_meta(index_dir)?;
-    let root_norm = best_effort_normalize(root);
-    let no_other_roots = meta
-        .roots
-        .iter()
-        .all(|r| best_effort_normalize(r) == root_norm);
-    meta.korean_morphology = korean_morphology_after_indexing_root(
-        meta.korean_morphology,
-        no_other_roots,
-        crate::korean_morphology_available(),
-    );
+    // 이미 등록된 근을 다시 보충 색인하는 경우 `roots`에 적힌 철자(전체 재구축은
+    // canonicalize 전 경로를 저장)를 키로 써야 근별 기록이 그 근에 붙는다.
     if !is_root_registered(&meta.roots, root) {
         meta.roots.push(root.to_path_buf());
     }
+    let root_norm = best_effort_normalize(root);
+    let key = meta
+        .roots
+        .iter()
+        .find(|r| best_effort_normalize(r) == root_norm)
+        .cloned()
+        .unwrap_or_else(|| root.to_path_buf());
+    meta.korean_morphology_roots
+        .insert(key, crate::korean_morphology_available());
     for (vol, cursor) in usn_cursors {
         meta.usn_cursors.entry(vol).or_insert(cursor);
     }
@@ -337,6 +333,7 @@ pub(crate) fn remove_root_from_meta(index_dir: &Path, root: &Path) -> Result<()>
     if meta.roots.len() == before {
         bail!("目录 {} 不是已注册的索引根", root.display());
     }
+    meta.korean_morphology_roots.remove(root);
     save_meta(index_dir, &meta)
 }
 
@@ -376,6 +373,7 @@ mod tests {
                 roots: vec![target_dir.path().to_path_buf()],
                 usn_cursors: HashMap::new(),
                 korean_morphology: None,
+                korean_morphology_roots: Default::default(),
             },
         )?;
 
@@ -407,6 +405,7 @@ mod tests {
                 roots: vec![target_dir.path().to_path_buf()],
                 usn_cursors: HashMap::new(),
                 korean_morphology: None,
+                korean_morphology_roots: Default::default(),
             },
         )?;
 
@@ -595,27 +594,20 @@ mod tests {
     }
 
     #[test]
-    fn korean_morphology_after_indexing_root_rules() {
-        // 다른 근이 없으면 현재 환경 값으로 확정(옛 meta의 None 포함)
-        for recorded in [None, Some(true), Some(false)] {
-            assert_eq!(
-                korean_morphology_after_indexing_root(recorded, true, true),
-                Some(true)
-            );
-            assert_eq!(
-                korean_morphology_after_indexing_root(recorded, true, false),
-                Some(false)
-            );
-        }
-        // 다른 근이 남아 있으면 기록 유지(섞인 색인은 불일치 안내가 계속 떠야 함)
-        for recorded in [None, Some(true), Some(false)] {
-            for available in [true, false] {
-                assert_eq!(
-                    korean_morphology_after_indexing_root(recorded, false, available),
-                    recorded
-                );
-            }
-        }
+    fn korean_morphology_of_prefers_per_root_record() {
+        let mut meta = IndexMeta {
+            schema_version: SCHEMA_VERSION,
+            roots: vec![PathBuf::from("a"), PathBuf::from("b")],
+            usn_cursors: HashMap::new(),
+            korean_morphology: None,
+            korean_morphology_roots: BTreeMap::new(),
+        };
+        assert_eq!(meta.korean_morphology_of(Path::new("a")), None);
+        meta.korean_morphology = Some(false);
+        meta.korean_morphology_roots
+            .insert(PathBuf::from("b"), true);
+        assert_eq!(meta.korean_morphology_of(Path::new("a")), Some(false));
+        assert_eq!(meta.korean_morphology_of(Path::new("b")), Some(true));
     }
 
     fn set_korean_morphology(index_dir: &Path, value: Option<bool>) -> Result<()> {
@@ -625,75 +617,138 @@ mod tests {
     }
 
     #[test]
-    fn append_root_keeps_or_updates_korean_morphology() -> Result<()> {
+    fn append_root_records_per_root_and_remove_drops_it() -> Result<()> {
         let available = crate::korean_morphology_available();
         let index_dir = tempfile::tempdir()?;
         let first = tempfile::Builder::new().prefix("dowse-test-").tempdir()?;
         std::fs::write(first.path().join("note.md"), "배터리팩의 내용")?;
         crate::rebuild_index(index_dir.path(), first.path())?;
+        assert!(
+            load_meta(index_dir.path())?
+                .korean_morphology_roots
+                .is_empty()
+        );
 
-        // 같은 환경에서 근 추가: 값 유지
+        // 기존 근이 다른 환경에서 색인됐다고 가정: 새 근만 현재 값, 기존 근은 그대로
+        set_korean_morphology(index_dir.path(), Some(!available))?;
         let second = tempfile::Builder::new().prefix("dowse-test2-").tempdir()?;
         append_root(index_dir.path(), second.path())?;
+        let meta = load_meta(index_dir.path())?;
+        assert_eq!(meta.korean_morphology, Some(!available));
+        assert_eq!(meta.korean_morphology_of(first.path()), Some(!available));
+        assert_eq!(meta.korean_morphology_of(second.path()), Some(available));
+        let status = crate::index_status(index_dir.path())?;
         assert_eq!(
-            load_meta(index_dir.path())?.korean_morphology,
-            Some(available)
+            status.korean_reindex_roots,
+            vec![first.path().to_path_buf()]
+        );
+        assert!(status.korean_dictionary_mismatch());
+        assert_eq!(
+            status.korean_morphology_indexed, None,
+            "근마다 다르면 요약은 None"
         );
 
-        // 기존 근이 다른 환경에서 색인된 경우: 섞인 색인이므로 기록 유지 → 불일치 안내 유지
-        set_korean_morphology(index_dir.path(), Some(!available))?;
-        let third = tempfile::Builder::new().prefix("dowse-test3-").tempdir()?;
-        append_root(index_dir.path(), third.path())?;
-        assert_eq!(
-            load_meta(index_dir.path())?.korean_morphology,
-            Some(!available)
-        );
-        assert!(crate::index_status(index_dir.path())?.korean_dictionary_mismatch());
+        // 낡은 근을 지우면 안내가 사라지고 요약도 현재 값으로 모인다
+        remove_root_from_meta(index_dir.path(), first.path())?;
+        let status = crate::index_status(index_dir.path())?;
+        assert!(!status.korean_dictionary_mismatch());
+        assert_eq!(status.korean_morphology_indexed, Some(available));
 
-        // 기록 없는 옛 meta + 기존 근 있음: 계속 알 수 없음
-        set_korean_morphology(index_dir.path(), None)?;
-        let fourth = tempfile::Builder::new().prefix("dowse-test4-").tempdir()?;
-        append_root(index_dir.path(), fourth.path())?;
-        assert_eq!(load_meta(index_dir.path())?.korean_morphology, None);
-
-        // 근을 모두 지운 뒤 추가: 색인 전체가 현재 환경 → 현재 값으로 확정
-        set_korean_morphology(index_dir.path(), Some(!available))?;
-        for root in load_meta(index_dir.path())?.roots {
-            remove_root_from_meta(index_dir.path(), &root)?;
-        }
-        let fifth = tempfile::Builder::new().prefix("dowse-test5-").tempdir()?;
-        append_root(index_dir.path(), fifth.path())?;
-        assert_eq!(
-            load_meta(index_dir.path())?.korean_morphology,
-            Some(available)
+        // 근을 지우면 근별 기록도 함께 지운다
+        remove_root_from_meta(index_dir.path(), second.path())?;
+        assert!(
+            load_meta(index_dir.path())?
+                .korean_morphology_roots
+                .is_empty()
         );
-        assert!(!crate::index_status(index_dir.path())?.korean_dictionary_mismatch());
         Ok(())
     }
 
     #[test]
-    fn register_root_with_cursors_updates_korean_morphology() -> Result<()> {
+    fn append_root_on_old_meta_keeps_old_roots_unknown() -> Result<()> {
+        let available = crate::korean_morphology_available();
+        let index_dir = tempfile::tempdir()?;
+        let first = tempfile::Builder::new().prefix("dowse-test-").tempdir()?;
+        std::fs::write(first.path().join("note.md"), "내용")?;
+        crate::rebuild_index(index_dir.path(), first.path())?;
+        set_korean_morphology(index_dir.path(), None)?;
+
+        let second = tempfile::Builder::new().prefix("dowse-test2-").tempdir()?;
+        append_root(index_dir.path(), second.path())?;
+        let meta = load_meta(index_dir.path())?;
+        assert_eq!(meta.korean_morphology_of(first.path()), None);
+        assert_eq!(meta.korean_morphology_of(second.path()), Some(available));
+        let status = crate::index_status(index_dir.path())?;
+        assert_eq!(status.korean_morphology_indexed, None);
+        assert!(
+            !status.korean_dictionary_mismatch(),
+            "기록 없는 근은 판단하지 않는다"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rescanning_every_root_clears_reindex_hint() -> Result<()> {
         let available = crate::korean_morphology_available();
         let index_dir = tempfile::tempdir()?;
         let first = tempfile::Builder::new().prefix("dowse-test-").tempdir()?;
         std::fs::write(first.path().join("note.md"), "배터리팩의 내용")?;
         crate::rebuild_index(index_dir.path(), first.path())?;
+        let second = tempfile::Builder::new().prefix("dowse-test2-").tempdir()?;
+        append_root(index_dir.path(), second.path())?;
 
-        // 유일한 근을 다시 보충 색인(멱등 재스캔): 전체가 현재 환경 → 갱신
-        set_korean_morphology(index_dir.path(), Some(!available))?;
-        register_root_with_cursors(index_dir.path(), first.path(), HashMap::new())?;
+        // 두 근 모두 다른 환경에서 색인된 상태
+        let mut meta = load_meta(index_dir.path())?;
+        meta.korean_morphology = Some(!available);
+        meta.korean_morphology_roots.clear();
+        save_meta(index_dir.path(), &meta)?;
         assert_eq!(
-            load_meta(index_dir.path())?.korean_morphology,
-            Some(available)
+            crate::index_status(index_dir.path())?
+                .korean_reindex_roots
+                .len(),
+            2
         );
 
-        // 다른 근이 남아 있는 상태에서 새 근 보충 색인: 기록 유지
-        set_korean_morphology(index_dir.path(), Some(!available))?;
-        let second = tempfile::Builder::new().prefix("dowse-test2-").tempdir()?;
-        register_root_with_cursors(index_dir.path(), second.path(), HashMap::new())?;
+        // 보충 색인(멱등 재스캔)은 roots에 적힌 철자를 키로 기록한다(canonicalize된
+        // 경로로 들어와도 같은 근으로 본다)
+        let first_canon = first.path().canonicalize()?;
+        register_root_with_cursors(index_dir.path(), &first_canon, HashMap::new())?;
         let meta = load_meta(index_dir.path())?;
-        assert_eq!(meta.korean_morphology, Some(!available));
-        assert_eq!(meta.roots.len(), 2);
+        assert_eq!(meta.roots.len(), 2, "이미 등록된 근은 다시 추가하지 않는다");
+        assert_eq!(meta.korean_morphology_of(first.path()), Some(available));
+        assert_eq!(
+            crate::index_status(index_dir.path())?.korean_reindex_roots,
+            vec![second.path().to_path_buf()]
+        );
+
+        // 남은 근도 다시 색인(remove + append = rebuild_root)하면 안내가 사라진다
+        remove_root_from_meta(index_dir.path(), second.path())?;
+        append_root(index_dir.path(), second.path())?;
+        let status = crate::index_status(index_dir.path())?;
+        assert!(!status.korean_dictionary_mismatch());
+        assert_eq!(status.korean_morphology_indexed, Some(available));
+        Ok(())
+    }
+
+    #[test]
+    fn rebuild_clears_per_root_records() -> Result<()> {
+        let index_dir = tempfile::tempdir()?;
+        let first = tempfile::Builder::new().prefix("dowse-test-").tempdir()?;
+        std::fs::write(first.path().join("note.md"), "내용")?;
+        crate::rebuild_index(index_dir.path(), first.path())?;
+        let second = tempfile::Builder::new().prefix("dowse-test2-").tempdir()?;
+        append_root(index_dir.path(), second.path())?;
+        assert!(
+            !load_meta(index_dir.path())?
+                .korean_morphology_roots
+                .is_empty()
+        );
+        crate::rebuild_index(index_dir.path(), first.path())?;
+        assert!(
+            load_meta(index_dir.path())?
+                .korean_morphology_roots
+                .is_empty()
+        );
         Ok(())
     }
 

@@ -167,6 +167,9 @@ pub struct IndexStatusOutput {
     /// 색인 시점과 지금의 사전 유무가 달라 재색인이 권장될 때의 안내문; 문제 없으면 생략
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reindex_hint: Option<String>,
+    /// 다시 색인하는 게 좋은 근(폴더) 목록; 없으면 생략
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reindex_roots: Vec<String>,
 }
 
 /// 索引规则的对外投影，对应核心库的 `IndexRules`。只读透出给 agent 看，
@@ -238,14 +241,20 @@ fn to_index_status_output(status: IndexStatus) -> IndexStatusOutput {
             .map(|d| d.as_millis() as i64)
     });
     let reindex_hint = status.korean_dictionary_mismatch().then(|| {
-        "색인을 만들 때와 지금의 한국어 사전(ko-dic) 사용 여부가 다릅니다. 한글 검색을 정확하게 하려면 `dowse index <폴더>`로 색인을 다시 만드세요."
+        "색인을 만들 때와 지금의 한국어 사전(ko-dic) 사용 여부가 다릅니다. 한글 검색을 정확하게 하려면 reindex_roots의 폴더를 다시 색인하세요(`dowse add <폴더>`는 등록된 폴더만 다시 색인하고 다른 폴더는 그대로 둠)."
             .to_string()
     });
+    let reindex_roots = status
+        .korean_reindex_roots
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
     IndexStatusOutput {
         num_docs: status.num_docs,
         korean_morphology_indexed: status.korean_morphology_indexed,
         korean_morphology_available: status.korean_morphology_available,
         reindex_hint,
+        reindex_roots,
         roots: status
             .roots
             .into_iter()

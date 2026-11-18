@@ -630,6 +630,7 @@ fn finish_rebuild(
             roots: vec![target_dir.to_path_buf()],
             usn_cursors,
             korean_morphology: Some(crate::korean_morphology_available()),
+            korean_morphology_roots: Default::default(),
         },
     )?;
 

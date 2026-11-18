@@ -300,6 +300,10 @@ fn status() -> Result<()> {
             ko(indexed),
             ko(status.korean_morphology_available)
         ),
+        None if status.korean_dictionary_mismatch() => println!(
+            "한국어 분석: 색인 시 폴더마다 다름 / 현재 {}",
+            ko(status.korean_morphology_available)
+        ),
         None => println!(
             "한국어 분석: 색인 시 기록 없음 / 현재 {}",
             ko(status.korean_morphology_available)
@@ -307,8 +311,11 @@ fn status() -> Result<()> {
     }
     if status.korean_dictionary_mismatch() {
         println!(
-            "안내: 색인을 만들 때와 지금의 한국어 사전(ko-dic) 사용 여부가 다릅니다. 한글 검색 결과를 정확하게 하려면 `dowse index <폴더>`로 색인을 다시 만드세요."
+            "안내: 색인을 만들 때와 지금의 한국어 사전(ko-dic) 사용 여부가 다릅니다. 한글 검색 결과를 정확하게 하려면 아래 폴더를 다시 색인하세요(`dowse add <폴더>`는 등록된 폴더만 다시 색인, `dowse index <폴더>`는 그 폴더 하나로 전체 재구축)."
         );
+        for r in &status.korean_reindex_roots {
+            println!("  {}", display_path(&r.to_string_lossy()));
+        }
     }
     Ok(())
 }

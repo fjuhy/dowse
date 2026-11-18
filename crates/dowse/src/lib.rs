@@ -117,7 +117,7 @@ pub use rules::{IndexRules, load_rules, save_rules};
 pub use searcher::{
     IndexedContentChunk, PreviewHit, SearchHit, SearchPage, Searcher, SortMode, normalize_ranges,
 };
-pub use status::{IndexStatus, index_status};
+pub use status::{IndexStatus, index_status, korean_reindex_roots};
 pub use tokenizer::korean_morphology_available;
 pub use updater::{BatchOutcome, IndexUpdater};
 pub use volume::ntfs_fast_path_available;

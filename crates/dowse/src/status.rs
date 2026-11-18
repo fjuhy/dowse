@@ -25,19 +25,63 @@ pub struct IndexStatus {
     /// 索引目录旁的 rules.json，无规则文件时是默认规则。让 `dowse status`
     /// 能把当前规则展示给用户，也让"某些文件因体积上限被挡"这类现象有据可查。
     pub rules: IndexRules,
-    /// 색인을 만들 때 한국어 형태소 사전(ko-dic)을 썼는지. 기록 이전 색인이면 None.
+    /// 색인을 만들 때 한국어 형태소 사전(ko-dic)을 썼는지. 모든 근이 같은 값으로
+    /// 기록돼 있을 때만 `Some`; 기록 이전 색인이거나 근마다 다르면 `None`.
     pub korean_morphology_indexed: Option<bool>,
     /// 지금 이 프로세스에서 ko-dic을 쓸 수 있는지.
     pub korean_morphology_available: bool,
+    /// 색인할 때의 ko-dic 사용 여부가 지금과 달라 다시 색인하는 게 좋은 근들
+    /// (`roots`에 적힌 그대로). 기록이 없는 근은 판단하지 않아 들어가지 않는다.
+    pub korean_reindex_roots: Vec<PathBuf>,
 }
 
 impl IndexStatus {
     /// 색인 시점과 지금의 ko-dic 사용 가능 여부가 달라 재색인이 권장되는지.
     /// 기록이 없는 옛 색인(None)은 판단하지 않는다(false).
     pub fn korean_dictionary_mismatch(&self) -> bool {
-        self.korean_morphology_indexed
-            .is_some_and(|indexed| indexed != self.korean_morphology_available)
+        !self.korean_reindex_roots.is_empty()
     }
+}
+
+/// (근별 기록 요약, 지금과 달라 다시 색인할 근들)
+fn korean_morphology_summary(
+    meta: &crate::meta::IndexMeta,
+    available: bool,
+) -> (Option<bool>, Vec<PathBuf>) {
+    let per_root: Vec<Option<bool>> = meta
+        .roots
+        .iter()
+        .map(|r| meta.korean_morphology_of(r))
+        .collect();
+    let summary = match per_root.first() {
+        // 근이 하나도 없으면 전체 재구축 기록을 그대로 보여 준다.
+        None => meta.korean_morphology,
+        Some(first) => per_root
+            .iter()
+            .all(|v| v == first)
+            .then_some(*first)
+            .flatten(),
+    };
+    let stale = meta
+        .roots
+        .iter()
+        .zip(&per_root)
+        .filter(|(_, v)| v.is_some_and(|indexed| indexed != available))
+        .map(|(r, _)| r.clone())
+        .collect();
+    (summary, stale)
+}
+
+/// 색인할 때의 한국어 사전(ko-dic) 사용 여부가 지금과 달라 다시 색인하는 게 좋은
+/// 근 목록. [`index_status`]의 `korean_reindex_roots`와 같지만 색인 크기를 세지 않아
+/// 가볍다(앱 화면이 창을 열 때마다 부른다). 처음 부르면 ko-dic 사전을 연다.
+///
+/// # Errors
+///
+/// meta.json을 읽을 수 없거나 schema 버전이 맞지 않으면 `Err`.
+pub fn korean_reindex_roots(index_dir: &Path) -> Result<Vec<PathBuf>> {
+    let meta = crate::meta::ensure_schema_version(index_dir)?;
+    Ok(korean_morphology_summary(&meta, crate::korean_morphology_available()).1)
 }
 
 /// 读索引的只读状态：文档数、已注册根、落盘体积、最近更新时间。
@@ -62,8 +106,10 @@ impl IndexStatus {
 /// ```
 pub fn index_status(index_dir: &Path) -> Result<IndexStatus> {
     let meta = crate::meta::ensure_schema_version(index_dir)?;
+    let korean_morphology_available = crate::korean_morphology_available();
+    let (korean_morphology_indexed, korean_reindex_roots) =
+        korean_morphology_summary(&meta, korean_morphology_available);
     let roots = meta.roots;
-    let korean_morphology_indexed = meta.korean_morphology;
 
     let mut disk_size_bytes = 0u64;
     let mut last_updated: Option<SystemTime> = None;
@@ -98,7 +144,8 @@ pub fn index_status(index_dir: &Path) -> Result<IndexStatus> {
         last_updated,
         rules,
         korean_morphology_indexed,
-        korean_morphology_available: crate::korean_morphology_available(),
+        korean_morphology_available,
+        korean_reindex_roots,
     })
 }
 
@@ -113,15 +160,26 @@ mod tests {
         std::fs::write(target_dir.path().join("note.md"), "배터리팩의 내용")?;
         crate::rebuild_index(index_dir.path(), target_dir.path())?;
 
-        let mut status = index_status(index_dir.path())?;
+        let status = index_status(index_dir.path())?;
         let available = crate::korean_morphology_available();
         assert_eq!(status.korean_morphology_indexed, Some(available));
         assert_eq!(status.korean_morphology_available, available);
         assert!(!status.korean_dictionary_mismatch());
+        assert!(korean_reindex_roots(index_dir.path())?.is_empty());
 
-        status.korean_morphology_indexed = Some(!available);
+        let mut meta = crate::meta::load_meta(index_dir.path())?;
+        meta.korean_morphology = Some(!available);
+        crate::meta::save_meta(index_dir.path(), &meta)?;
+        let status = index_status(index_dir.path())?;
+        assert_eq!(status.korean_morphology_indexed, Some(!available));
         assert!(status.korean_dictionary_mismatch());
-        status.korean_morphology_indexed = None;
+        assert_eq!(status.korean_reindex_roots, status.roots);
+        assert_eq!(korean_reindex_roots(index_dir.path())?, status.roots);
+
+        meta.korean_morphology = None;
+        crate::meta::save_meta(index_dir.path(), &meta)?;
+        let status = index_status(index_dir.path())?;
+        assert_eq!(status.korean_morphology_indexed, None);
         assert!(!status.korean_dictionary_mismatch());
         Ok(())
     }
