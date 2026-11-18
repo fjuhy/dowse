@@ -206,11 +206,13 @@ pub struct SearchHit {
     pub highlighted: Vec<Range<usize>>,
     /// 文件扩展名（不含点，小写），无扩展名时是空串。给 MCP 等消费方标注文件类型用。
     pub ext: String,
-    /// 문서 속성(schema v8): Office `docProps/core.xml` 또는 PDF Info의 작성자/제목.
+    /// 문서 속성(schema v8): Office `docProps/core.xml` 또는 PDF Info의 작성자.
     pub author: Option<String>,
+    /// 문서 속성(schema v8): Office `docProps/core.xml` 또는 PDF Info의 제목.
     pub title: Option<String>,
-    /// 문서 속성의 작성일/수정일(UTC 밀리초 Unix 타임스탬프). 파일 시스템 mtime과 별개.
+    /// 문서 속성의 작성일(UTC 밀리초 Unix 타임스탬프). 파일 시스템 mtime과 별개.
     pub doc_created: Option<i64>,
+    /// 문서 속성의 수정일(UTC 밀리초 Unix 타임스탬프). 파일 시스템 mtime과 별개.
     pub doc_modified: Option<i64>,
 }
 
