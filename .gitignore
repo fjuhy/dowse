@@ -15,6 +15,8 @@
 
 # Tauri sidecar 产物：构建时从 target/release 复制进来，不进仓库
 /crates/dowse-app/src-tauri/binaries/
+# 설치 파일용 한국어 사전: scripts/prepare-ko-dic.mjs가 빌드 때 준비한다
+/crates/dowse-app/src-tauri/ko-dic/
 
 # Playwright MCP 调试产物
 /.playwright-mcp/
