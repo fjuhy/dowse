@@ -8,7 +8,6 @@ use std::time::SystemTime;
 use anyhow::Result;
 use walkdir::WalkDir;
 
-use crate::registered_roots;
 use crate::rules::IndexRules;
 
 /// 索引的只读状态快照，给 CLI/MCP 的 `index_status` 一类查询用。
@@ -26,6 +25,19 @@ pub struct IndexStatus {
     /// 索引目录旁的 rules.json，无规则文件时是默认规则。让 `dowse status`
     /// 能把当前规则展示给用户，也让"某些文件因体积上限被挡"这类现象有据可查。
     pub rules: IndexRules,
+    /// 색인을 만들 때 한국어 형태소 사전(ko-dic)을 썼는지. 기록 이전 색인이면 None.
+    pub korean_morphology_indexed: Option<bool>,
+    /// 지금 이 프로세스에서 ko-dic을 쓸 수 있는지.
+    pub korean_morphology_available: bool,
+}
+
+impl IndexStatus {
+    /// 색인 시점과 지금의 ko-dic 사용 가능 여부가 달라 재색인이 권장되는지.
+    /// 기록이 없는 옛 색인(None)은 판단하지 않는다(false).
+    pub fn korean_dictionary_mismatch(&self) -> bool {
+        self.korean_morphology_indexed
+            .is_some_and(|indexed| indexed != self.korean_morphology_available)
+    }
 }
 
 /// 读索引的只读状态：文档数、已注册根、落盘体积、最近更新时间。
@@ -49,7 +61,9 @@ pub struct IndexStatus {
 /// # }
 /// ```
 pub fn index_status(index_dir: &Path) -> Result<IndexStatus> {
-    let roots = registered_roots(index_dir)?;
+    let meta = crate::meta::ensure_schema_version(index_dir)?;
+    let roots = meta.roots;
+    let korean_morphology_indexed = meta.korean_morphology;
 
     let mut disk_size_bytes = 0u64;
     let mut last_updated: Option<SystemTime> = None;
@@ -83,12 +97,34 @@ pub fn index_status(index_dir: &Path) -> Result<IndexStatus> {
         disk_size_bytes,
         last_updated,
         rules,
+        korean_morphology_indexed,
+        korean_morphology_available: crate::korean_morphology_available(),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn korean_dictionary_mismatch_only_when_recorded_and_different() -> Result<()> {
+        let index_dir = tempfile::tempdir()?;
+        let target_dir = tempfile::Builder::new().prefix("dowse-test-").tempdir()?;
+        std::fs::write(target_dir.path().join("note.md"), "배터리팩의 내용")?;
+        crate::rebuild_index(index_dir.path(), target_dir.path())?;
+
+        let mut status = index_status(index_dir.path())?;
+        let available = crate::korean_morphology_available();
+        assert_eq!(status.korean_morphology_indexed, Some(available));
+        assert_eq!(status.korean_morphology_available, available);
+        assert!(!status.korean_dictionary_mismatch());
+
+        status.korean_morphology_indexed = Some(!available);
+        assert!(status.korean_dictionary_mismatch());
+        status.korean_morphology_indexed = None;
+        assert!(!status.korean_dictionary_mismatch());
+        Ok(())
+    }
 
     #[test]
     fn index_status_on_missing_index_errors() {

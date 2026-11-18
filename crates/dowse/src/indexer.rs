@@ -629,6 +629,7 @@ fn finish_rebuild(
             schema_version: SCHEMA_VERSION,
             roots: vec![target_dir.to_path_buf()],
             usn_cursors,
+            korean_morphology: Some(crate::korean_morphology_available()),
         },
     )?;
 

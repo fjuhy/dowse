@@ -52,6 +52,12 @@ pub struct IndexMeta {
     pub roots: Vec<PathBuf>,
     #[serde(default)]
     pub usn_cursors: HashMap<VolumeKey, UsnCursor>,
+    /// 마지막 전체 재구축 때 한국어 형태소 사전(ko-dic)을 썼는지. 이 값은 schema
+    /// 버전에 넣지 않는다: 사전 유무가 달라도 색인은 열리고 검색도 되지만(한글
+    /// 토큰 경계만 달라짐), 현재 환경과 다르면 status에서 재색인을 안내한다.
+    /// 이 필드가 생기기 전 meta.json은 `None`(알 수 없음).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub korean_morphology: Option<bool>,
 }
 
 /// meta.json 放在索引目录的**兄弟**位置（`<index_dir>-meta.json`），不是塞进
@@ -333,6 +339,7 @@ mod tests {
                 schema_version: SCHEMA_VERSION + 1,
                 roots: vec![target_dir.path().to_path_buf()],
                 usn_cursors: HashMap::new(),
+                korean_morphology: None,
             },
         )?;
 
@@ -363,6 +370,7 @@ mod tests {
                 schema_version: SCHEMA_VERSION - 1,
                 roots: vec![target_dir.path().to_path_buf()],
                 usn_cursors: HashMap::new(),
+                korean_morphology: None,
             },
         )?;
 
@@ -404,6 +412,24 @@ mod tests {
 
         let meta = load_meta(index_dir.path())?;
         assert!(meta.usn_cursors.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn rebuild_records_korean_morphology_and_old_meta_reads_as_unknown() -> Result<()> {
+        let index_dir = tempfile::tempdir()?;
+        let target_dir = tempfile::Builder::new().prefix("dowse-test-").tempdir()?;
+        std::fs::write(target_dir.path().join("note.md"), "배터리팩의 내용")?;
+        crate::rebuild_index(index_dir.path(), target_dir.path())?;
+        let meta = load_meta(index_dir.path())?;
+        assert_eq!(
+            meta.korean_morphology,
+            Some(crate::korean_morphology_available())
+        );
+
+        let path = meta_path(index_dir.path());
+        std::fs::write(&path, r#"{"schema_version":8,"roots":["C:\\watch"]}"#)?;
+        assert_eq!(load_meta(index_dir.path())?.korean_morphology, None);
         Ok(())
     }
 

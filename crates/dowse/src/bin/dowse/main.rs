@@ -287,6 +287,29 @@ fn status() -> Result<()> {
     }
     println!("索引规则:");
     print_rules(&status.rules);
+    let ko = |v: bool| {
+        if v {
+            "ko-dic 형태소 분석"
+        } else {
+            "어절 단위(사전 없음)"
+        }
+    };
+    match status.korean_morphology_indexed {
+        Some(indexed) => println!(
+            "한국어 분석: 색인 시 {} / 현재 {}",
+            ko(indexed),
+            ko(status.korean_morphology_available)
+        ),
+        None => println!(
+            "한국어 분석: 색인 시 기록 없음 / 현재 {}",
+            ko(status.korean_morphology_available)
+        ),
+    }
+    if status.korean_dictionary_mismatch() {
+        println!(
+            "안내: 색인을 만들 때와 지금의 한국어 사전(ko-dic) 사용 여부가 다릅니다. 한글 검색 결과를 정확하게 하려면 `dowse index <폴더>`로 색인을 다시 만드세요."
+        );
+    }
     Ok(())
 }
 

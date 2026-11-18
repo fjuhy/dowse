@@ -158,6 +158,15 @@ pub struct IndexStatusOutput {
     /// 当前生效的索引规则：哪些目录被排除、额外当文本索引的扩展名、单文件体积上限。
     /// 让 agent 明白"为什么某些文件搜不到"（可能被排除或超体积上限挡在索引外）
     pub rules: IndexRulesOut,
+    /// 색인을 만들 때 한국어 형태소 사전(ko-dic)을 썼는지; 기록 이전 색인이면 생략
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub korean_morphology_indexed: Option<bool>,
+    /// 지금 ko-dic을 쓸 수 있는지
+    #[serde(default)]
+    pub korean_morphology_available: bool,
+    /// 색인 시점과 지금의 사전 유무가 달라 재색인이 권장될 때의 안내문; 문제 없으면 생략
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reindex_hint: Option<String>,
 }
 
 /// 索引规则的对外投影，对应核心库的 `IndexRules`。只读透出给 agent 看，
@@ -228,8 +237,15 @@ fn to_index_status_output(status: IndexStatus) -> IndexStatusOutput {
             .ok()
             .map(|d| d.as_millis() as i64)
     });
+    let reindex_hint = status.korean_dictionary_mismatch().then(|| {
+        "색인을 만들 때와 지금의 한국어 사전(ko-dic) 사용 여부가 다릅니다. 한글 검색을 정확하게 하려면 `dowse index <폴더>`로 색인을 다시 만드세요."
+            .to_string()
+    });
     IndexStatusOutput {
         num_docs: status.num_docs,
+        korean_morphology_indexed: status.korean_morphology_indexed,
+        korean_morphology_available: status.korean_morphology_available,
+        reindex_hint,
         roots: status
             .roots
             .into_iter()
@@ -993,7 +1009,12 @@ mod tests {
             .iter()
             .find(|h| h["kind"] == "md")
             .unwrap();
-        for key in ["author", "title", "doc_created_unix_ms", "doc_modified_unix_ms"] {
+        for key in [
+            "author",
+            "title",
+            "doc_created_unix_ms",
+            "doc_modified_unix_ms",
+        ] {
             assert!(md_raw.get(key).is_none(), "{key} 应被省略: {md_raw}");
         }
     }
