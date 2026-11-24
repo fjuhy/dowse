@@ -29,9 +29,8 @@ try {
     Compress-Archive -Path "$portable/*" -DestinationPath "$release/IndexRay-portable-x64.zip" -Force
     Compress-Archive -LiteralPath 'skills/search-document-library/SKILL.md' -DestinationPath "$release/search-document-library.zip" -Force
     $assets = 'IndexRay-x64-setup.exe', 'IndexRay-portable-x64.zip', 'search-document-library.zip'
-    $assets | ForEach-Object {
-        '{0}  {1}' -f (Get-FileHash -LiteralPath (Join-Path $release $_)).Hash.ToLowerInvariant(), $_
-    } | Set-Content -LiteralPath "$release/SHA256SUMS.txt" -Encoding ascii
+    python -c "import hashlib, pathlib, sys; root = pathlib.Path(sys.argv[1]); (root / 'SHA256SUMS.txt').write_text(''.join(hashlib.sha256((root / name).read_bytes()).hexdigest() + '  ' + name + '\n' for name in sys.argv[2:]), encoding='ascii', newline='\n')" $release @assets
+    if ($LASTEXITCODE) { throw 'Checksum generation failed' }
 } finally {
     Pop-Location
 }
