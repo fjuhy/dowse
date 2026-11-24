@@ -3,7 +3,7 @@
 //! 用官方 rmcp client SDK 当测试客户端——这样握手细节（协议版本协商、
 //! JSON-RPC 帧格式）交给 SDK 自己保证一致，不用我们手搓协议帧。
 //!
-//! 用 `INDEXRAY_INDEX_DIR` 环境变量把子进程指向一个 tempdir 索引，不碰
+//! 用 `DOWSE_INDEX_DIR` 环境变量把子进程指向一个 tempdir 索引，不碰
 //! 用户机器上 `%LOCALAPPDATA%\dowse\index` 那份真索引。
 
 use rmcp::ServiceExt;
@@ -45,7 +45,7 @@ async fn stdio_handshake_lists_tools_and_search_returns_structured_hit() {
     let client = ()
         .serve(
             TokioChildProcess::new(Command::new(mcp_binary()).configure(|cmd| {
-                cmd.arg("mcp").env("INDEXRAY_INDEX_DIR", &index_dir_arg);
+                cmd.arg("mcp").env("DOWSE_INDEX_DIR", &index_dir_arg);
             }))
             .expect("构造子进程 transport 失败"),
         )
@@ -58,8 +58,8 @@ async fn stdio_handshake_lists_tools_and_search_returns_structured_hit() {
         .as_ref()
         .and_then(|info| info.server_info.as_ref())
         .expect("initialize 应返回 serverInfo");
-    assert_eq!(implementation.name, "indexray-cli");
-    assert_eq!(implementation.version, "1.1.0");
+    assert_eq!(implementation.name, "dowse");
+    assert_eq!(implementation.version, env!("CARGO_PKG_VERSION"));
 
     // tools/list：四个只读工具都应该在，且不应该有任何变更类工具。
     let tools = client
@@ -181,7 +181,7 @@ async fn tools_call_index_status_on_missing_index_returns_tool_level_error_with_
     let client = ()
         .serve(
             TokioChildProcess::new(Command::new(mcp_binary()).configure(|cmd| {
-                cmd.arg("mcp").env("INDEXRAY_INDEX_DIR", &index_dir_arg);
+                cmd.arg("mcp").env("DOWSE_INDEX_DIR", &index_dir_arg);
             }))
             .expect("构造子进程 transport 失败"),
         )
@@ -203,7 +203,7 @@ async fn tools_call_index_status_on_missing_index_returns_tool_level_error_with_
     let structured = result.structured_content.expect("应该带结构化错误内容");
     let hint = structured["hint"].as_str().unwrap_or_default();
     assert!(
-        hint.contains("indexray-cli index"),
+        hint.contains("dowse index"),
         "hint 字段应带建库指引: {structured:#?}"
     );
 

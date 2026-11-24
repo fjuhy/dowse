@@ -1,7 +1,4 @@
 mod mcp;
-#[path = "../profile/mod.rs"]
-mod profile;
-use profile::index_dir;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,11 +15,7 @@ use rmcp::ServiceExt;
 use rmcp::transport::stdio;
 
 #[derive(Parser)]
-#[command(
-    name = "indexray-cli",
-    about = "IndexRay 로컬 문서 검색",
-    version = "1.1.0"
-)]
+#[command(name = "dowse", about = "探水杖：Windows 本地全盘搜索", version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -30,8 +23,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Export indexed document text into a Markdown folder.
-    Export { folder: PathBuf },
     /// 全量重建索引
     Index {
         /// 要索引的目录
@@ -45,9 +36,11 @@ enum Command {
     },
     /// 搜索已建好的索引
     Search {
-        /// 검색식. name:파일명, body:본문, ext:pdf,docx, path:경로, title:제목, author:작성자,
-        /// mtime:>=2026-01, size:<10mb를 지원합니다. 공백은 AND로 처리합니다.
-        /// 큰따옴표로 구문을 지정하고, 괄호와 대문자 AND / OR / NOT 또는 -로 조건을 조합합니다.
+        /// 查询词，支持多个词（AND）和 "短语"。还支持内联操作符：path:关键词（按
+        /// 路径）、author:作者 / title:标题（按文档属性）、mtime:>2026-01-01 / mtime:<=2026-07（按修改日期，比较符 > >= < <=，
+        /// 日期 YYYY-MM-DD 或 YYYY-MM）、size:>10mb / size:<500kb（按体积，单位
+        /// kb/mb/gb）、大写 OR 分组（组内空格为 AND）、-词 或 NOT 词 排除；带空格
+        /// 的操作数加引号，如 path:"我的 文档"
         query: Vec<String>,
         /// 最多返回几条
         #[arg(short = 'n', long, default_value_t = 10)]
@@ -97,12 +90,24 @@ enum RulesAction {
     },
 }
 
+/// 索引统一放在 %LOCALAPPDATA%\dowse\index，跟被索引的目录无关。
+///
+/// `DOWSE_INDEX_DIR` 环境变量可以覆盖这个位置：集成测试（tests/mcp_integration.rs）
+/// 靠它把子进程指向一个临时索引，不碰用户机器上真的那份。这是只给测试/CI 基础设施
+/// 用的内部逃生舱，不是产品对外配置项——正常使用不该设它，也因此刻意不写进 `--help`，
+/// 免得被当成稳定接口来承诺。
+fn index_dir() -> Result<PathBuf> {
+    if let Ok(dir) = std::env::var("DOWSE_INDEX_DIR") {
+        return Ok(PathBuf::from(dir));
+    }
+    let dirs = directories::ProjectDirs::from("", "", "dowse").context("拿不到用户数据目录")?;
+    Ok(dirs.data_local_dir().join("index"))
+}
+
 fn main() -> Result<()> {
-    dowse::use_directory_scans();
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Export { folder } => println!("{}", dowse::export::sync(&index_dir()?, &folder)?),
         Command::Index { dir } => {
             let dir = dir.canonicalize().context("目标目录不存在")?;
             println!("索引目标: {}", dir.display());
@@ -126,7 +131,7 @@ fn main() -> Result<()> {
                 );
             }
 
-            // CLI 一次性建索引时，文本可搜之后再同步跑完 OCR 队列。
+            // 文本先行可搜之后，紧接着把 OCR 队列同步跑完——`dowse index` 是一次性
             // 命令，用户期望它退出时索引就是完整状态，而不是留一堆图片"回头再说"
             // （常驻的托盘程序不需要这一步，图片交给后台 worker 池慢慢消化）。
             let ocr_stats = drain_ocr_queue(&index_dir()?, DEFAULT_WORKERS)?;
@@ -191,7 +196,8 @@ fn main() -> Result<()> {
 }
 
 /// `dowse add`：增量补扫，往已有索引里再加一个根目录。只索引这个新目录、把它
-/// 追加进已注册根列表，索引里其它根的文档原样保留（`indexray-cli index` 会全量重建）。
+/// 追加进已注册根列表，索引里其它根的文档原样保留（对比 `dowse index` 会删掉整个
+/// 索引从头重建）。报告风格跟 `dowse index` 保持一致。
 fn add_root_cmd(dir: PathBuf) -> Result<()> {
     let index = index_dir()?;
     let dir = dir.canonicalize().context("目标目录不存在")?;
@@ -200,9 +206,9 @@ fn add_root_cmd(dir: PathBuf) -> Result<()> {
     // 补扫复用一个现开的写入端；下面 drain_ocr_queue 会自己开一个写入端，一个索引
     // 同一时刻只能有一个 IndexWriter，所以补扫用完必须先 drop 掉再去跑 OCR。
     let mut updater = IndexUpdater::open(&index)
-        .context("打不开索引写入端，先跑 `indexray-cli index <目录>` 建一次索引")?;
+        .context("打不开索引写入端，先跑 `dowse index <目录>` 建一次索引")?;
     // 核心层回调已降频到每 PROGRESS_INTERVAL(50) 个文件一次，这里再降到每千个
-    // （50 的整数倍）打一行，避免大目录刷屏。
+    // （50 的整数倍）打一行，跟 `dowse index` 一样避免大目录刷屏。
     let stats = index_root_incremental_with_progress(&index, &dir, &mut updater, |progress| {
         if progress.processed % 1000 == 0 {
             println!("  已处理 {} 个文件…", progress.processed);
@@ -222,7 +228,7 @@ fn add_root_cmd(dir: PathBuf) -> Result<()> {
         );
     }
 
-    // 同步处理新根目录的 OCR 队列。
+    // 跟 `dowse index` 一样，把新根名下图片的 OCR 同步跑完，让命令退出时索引就是
     // 完整状态（常驻托盘程序才把图片交给后台 worker 池慢慢消化）。
     let ocr_stats = drain_ocr_queue(&index, DEFAULT_WORKERS)?;
     if !ocr_stats.available {
@@ -257,8 +263,8 @@ async fn run_mcp_async() -> Result<()> {
 /// 占多大盘、注册了哪些根、最近一次更新在什么时候。
 fn status() -> Result<()> {
     let dir = index_dir()?;
-    let status = index_status(&dir)
-        .context("读不到索引状态，先跑 `indexray-cli index <目录>` 建一次索引")?;
+    let status =
+        index_status(&dir).context("读不到索引状态，先跑 `dowse index <目录>` 建一次索引")?;
 
     println!("索引位置: {}", dir.display());
     println!("文档总数: {}", status.num_docs);
@@ -305,7 +311,7 @@ fn status() -> Result<()> {
     }
     if status.korean_dictionary_mismatch() {
         println!(
-            "안내: 색인을 만들 때와 지금의 한국어 사전(ko-dic) 사용 여부가 다릅니다. 한글 검색 결과를 정확하게 하려면 아래 폴더를 다시 색인하세요(`indexray-cli add <폴더>`는 등록된 폴더만 다시 색인, `indexray-cli index <폴더>`는 그 폴더 하나로 전체 재구축)."
+            "안내: 색인을 만들 때와 지금의 한국어 사전(ko-dic) 사용 여부가 다릅니다. 한글 검색 결과를 정확하게 하려면 아래 폴더를 다시 색인하세요(`dowse add <폴더>`는 등록된 폴더만 다시 색인, `dowse index <폴더>`는 그 폴더 하나로 전체 재구축)."
         );
         for r in &status.korean_reindex_roots {
             println!("  {}", display_path(&r.to_string_lossy()));
@@ -348,7 +354,7 @@ fn rules_cmd(action: RulesAction) -> Result<()> {
             println!("规则已更新:");
             print_rules(&rules);
             println!(
-                "\n提示: 规则修改后需要重建索引（indexray-cli index <目录>）才能完全生效——\
+                "\n提示: 规则修改后需要重建索引（dowse index <目录>）才能完全生效——\
                  已在索引里的文件不会被自动重新评估。"
             );
         }
@@ -410,9 +416,9 @@ fn watch(dir: Option<PathBuf>) -> Result<()> {
         Some(d) => vec![d.canonicalize().context("目标目录不存在")?],
         None => {
             let roots = registered_roots(&index)
-                .context("读不到已注册的索引根，先跑 `indexray-cli index <目录>` 建一次索引")?;
+                .context("读不到已注册的索引根，先跑 `dowse index <目录>` 建一次索引")?;
             if roots.is_empty() {
-                anyhow::bail!("索引里没有已注册的根目录，先跑 `indexray-cli index <目录>`");
+                anyhow::bail!("索引里没有已注册的根目录，先跑 `dowse index <目录>`");
             }
             roots
         }

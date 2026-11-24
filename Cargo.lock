@@ -1339,7 +1339,6 @@ dependencies = [
  "clap",
  "ctrlc",
  "directories",
- "embed-resource",
  "encoding_rs",
  "flate2",
  "lindera",
