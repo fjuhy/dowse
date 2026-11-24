@@ -1,4 +1,5 @@
 /target
+/release/
 /testdata
 
 # 打包/构建过程遗留的临时产物，别提交进仓库

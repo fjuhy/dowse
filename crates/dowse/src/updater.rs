@@ -266,29 +266,19 @@ impl IndexUpdater {
         mut on_progress: impl FnMut(IndexProgress),
     ) -> Result<(usize, usize, usize)> {
         self.commit_with_retry(|this| {
-            let mut indexed = 0usize;
-            let mut skipped = 0usize;
-            let mut skipped_oversize = 0usize;
-            let mut touched_image = false;
-            for (i, path) in files.iter().enumerate() {
-                match this.upsert_one(path, &mut touched_image)? {
-                    AddOutcome::Indexed => indexed += 1,
-                    // 超限跳过既计入总跳过数，也单独累加一份明细——跟
-                    // `rebuild_index_attempt` 的收录循环同一口径。
-                    AddOutcome::Skipped => skipped += 1,
-                    AddOutcome::SkippedOversize => {
-                        skipped += 1;
-                        skipped_oversize += 1;
+            let touched_image = std::sync::atomic::AtomicBool::new(false);
+            let (indexed, skipped, skipped_oversize) = crate::indexer::process_files_parallel(
+                files,
+                |path| {
+                    this.delete_exact(path);
+                    if is_image(path) {
+                        touched_image.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
-                }
-                let processed = i + 1;
-                if processed % PROGRESS_INTERVAL == 0 {
-                    on_progress(IndexProgress {
-                        processed,
-                        path: path.clone(),
-                    });
-                }
-            }
+                    add_file_document(&this.writer, &this.fields, path, &this.index_dir)
+                },
+                &mut on_progress,
+            )?;
+            let touched_image = touched_image.load(std::sync::atomic::Ordering::Relaxed);
             // 顺序不变量同 `apply_with_progress`：OCR 队列必须先于 commit 落盘。
             let index_dir = this.index_dir.clone();
             commit_index_tail(
@@ -413,10 +403,24 @@ impl IndexUpdater {
         &self.fields
     }
 
-    /// 按精确 path 删一篇文档。删不存在的 term 是空操作，幂等无害。
+    /// 按精确 path 删一篇文档（若该文件是 PST/OST 等多文档容器，连同 `path::*` 虚拟子文档一并删除）。
     fn delete_exact(&self, path: &Path) {
-        let term = Term::from_field_text(self.fields.path, &path.to_string_lossy());
+        let exact = path.to_string_lossy();
+        let term = Term::from_field_text(self.fields.path, &exact);
         self.writer.delete_term(term);
+        if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("pst") || e.eq_ignore_ascii_case("ost"))
+        {
+            let sub_low = format!("{exact}::");
+            let sub_high = format!("{exact}::\u{10FFFF}");
+            let sub_q = RangeQuery::new(
+                Bound::Included(Term::from_field_text(self.fields.path, &sub_low)),
+                Bound::Excluded(Term::from_field_text(self.fields.path, &sub_high)),
+            );
+            let _ = self.writer.delete_query(Box::new(sub_q));
+        }
     }
 
     /// 删除一个路径及其整棵子树。既删这个 path 本身（它若是文件，删掉文件文档），
@@ -445,9 +449,16 @@ impl IndexUpdater {
             Bound::Included(Term::from_field_text(self.fields.path, &prefix)),
             Bound::Excluded(Term::from_field_text(self.fields.path, &upper)),
         );
+        let container_low = format!("{exact}::");
+        let container_high = format!("{exact}::\u{10FFFF}");
+        let container_query = RangeQuery::new(
+            Bound::Included(Term::from_field_text(self.fields.path, &container_low)),
+            Bound::Excluded(Term::from_field_text(self.fields.path, &container_high)),
+        );
         let query = BooleanQuery::new(vec![
             (Occur::Should, Box::new(exact_query) as Box<dyn Query>),
             (Occur::Should, Box::new(subtree_query) as Box<dyn Query>),
+            (Occur::Should, Box::new(container_query) as Box<dyn Query>),
         ]);
 
         // 手动重载的只读 reader 反映当前已提交状态，删的正是这些已入索引的旧文档。

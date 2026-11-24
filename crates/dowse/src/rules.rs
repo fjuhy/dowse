@@ -46,6 +46,9 @@ pub struct IndexRules {
     /// 只追加、不覆盖内建白名单，命中的文件按纯文本读（自动探测编码）。
     #[serde(default)]
     pub extra_text_exts: Vec<String>,
+    /// Explicit indexing allowlist. Missing values preserve existing defaults.
+    #[serde(default)]
+    pub enabled_extensions: Option<Vec<String>>,
     /// 单文件体积上限（MB）。超过上限的文件不抽取、跳过。
     #[serde(default = "default_max_file_mb")]
     pub max_file_mb: u64,
@@ -67,6 +70,7 @@ impl Default for IndexRules {
         Self {
             exclude_dirs: default_exclude_dirs(),
             extra_text_exts: Vec::new(),
+            enabled_extensions: None,
             max_file_mb: DEFAULT_MAX_FILE_MB,
         }
     }
@@ -89,6 +93,30 @@ impl IndexRules {
                 .map(|s| s.trim().trim_start_matches('.').to_ascii_lowercase())
                 .filter(|s| !s.is_empty()),
         );
+        if let Some(list) = &mut self.enabled_extensions {
+            *list = dedup_preserving_order(
+                list.iter()
+                    .map(|s| s.trim().trim_start_matches('.').to_ascii_lowercase())
+                    .filter(|s| !s.is_empty()),
+            );
+        }
+    }
+
+    /// Extensions currently enabled for indexing.
+    pub fn effective_extensions(&self) -> Vec<String> {
+        self.enabled_extensions.clone().unwrap_or_else(|| {
+            dedup_preserving_order(
+                crate::extract::builtin_extensions()
+                    .map(str::to_owned)
+                    .chain(self.extra_text_exts.iter().cloned()),
+            )
+        })
+    }
+
+    pub(crate) fn allows_extension(&self, ext: &str) -> bool {
+        self.enabled_extensions
+            .as_ref()
+            .is_none_or(|list| list.iter().any(|item| item == ext))
     }
 
     /// 单文件体积上限换算成字节。`max_file_mb` 超大时用饱和乘法兜底，不 panic
@@ -107,6 +135,10 @@ impl IndexRules {
     /// 这个扩展名是否在追加白名单里（调用方保证传进来的是小写、不含点）。
     pub(crate) fn is_extra_text_ext(&self, ext: &str) -> bool {
         self.extra_text_exts.iter().any(|e| e == ext)
+            || self.enabled_extensions.as_ref().is_some_and(|list| {
+                list.iter().any(|e| e == ext)
+                    && !crate::extract::builtin_extensions().any(|builtin| builtin == ext)
+            })
     }
 
     /// `path` 从 `root` 往下数，中间是否穿过了任一被排除的目录。给 MFT 快速
@@ -125,7 +157,23 @@ impl IndexRules {
         self.path_has_excluded_dir(path, root, true)
     }
 
+    pub(crate) fn explicit_exclusion(&self, path: &Path) -> bool {
+        let clean = |p: &Path| {
+            crate::display_path(&p.to_string_lossy())
+                .replace('/', std::path::MAIN_SEPARATOR_STR)
+                .to_lowercase()
+        };
+        self.exclude_dirs
+            .iter()
+            .map(Path::new)
+            .filter(|p| p.is_absolute())
+            .any(|p| Path::new(&clean(path)).starts_with(clean(p)))
+    }
+
     fn path_has_excluded_dir(&self, path: &Path, root: &Path, include_last: bool) -> bool {
+        if self.explicit_exclusion(path) {
+            return true;
+        }
         let Ok(rel) = path.strip_prefix(root) else {
             return false;
         };
@@ -305,6 +353,7 @@ mod tests {
         let rules = IndexRules {
             exclude_dirs: vec!["node_modules".into(), "dist".into()],
             extra_text_exts: vec!["rst".into(), "adoc".into()],
+            enabled_extensions: None,
             max_file_mb: 64,
         };
         save_rules(&index_dir, &rules).unwrap();
@@ -346,6 +395,7 @@ mod tests {
                 "".into(),
             ],
             extra_text_exts: vec![".RST".into(), "adoc".into(), "ADOC".into(), " ".into()],
+            enabled_extensions: None,
             max_file_mb: 10,
         };
         rules.normalize();
@@ -358,6 +408,7 @@ mod tests {
         let rules = IndexRules {
             exclude_dirs: vec!["build".into()],
             extra_text_exts: vec![],
+            enabled_extensions: None,
             max_file_mb: 20,
         };
         assert!(rules.is_dir_excluded("build"));
@@ -372,6 +423,7 @@ mod tests {
         let rules = IndexRules {
             exclude_dirs: vec!["node_modules".into()],
             extra_text_exts: vec![],
+            enabled_extensions: None,
             max_file_mb: 20,
         };
         let root = Path::new("/proj");

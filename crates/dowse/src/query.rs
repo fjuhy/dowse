@@ -1,16 +1,5 @@
-//! 查询串里的内联操作符解析。
-//!
-//! 三端（CLI / GUI / MCP）共用同一个查询字符串入口，所以把 `path:`、`mtime:`、
-//! `size:`、`OR`、`NOT`/`-` 这些操作符直接做进查询串里，任何一端都零接线自动获益。
-//! tantivy 自带的 `QueryParser` 只懂"字段:词"这类文本查询，不认识我们的日期 /
-//! 体积 / 路径语义，也没法表达"AND 优先级高于 OR"的分组；因此这里单独放一层
-//! **纯字符串解析**：只把查询串拆成结构化的 [`Parsed`]，完全不碰 tantivy、不碰
-//! 索引，好离线单测、也好独立演进。真正把结构翻译成 tantivy 查询在 `searcher.rs`。
-//!
-//! 向后兼容是硬约束：不含任何操作符的查询必须和从前逐字节一致地走老路径。为此
-//! [`parse`] 一旦发现整串里没有任何操作符，就把 [`Parsed::has_operators`] 置 false、
-//! 不做任何结构化拆分，让调用方把**原始查询串**原样交回给老的 `QueryParser`。
-//! 只有确实出现操作符时才启用下面这套分组/过滤逻辑。
+//! Shared GUI/CLI/MCP syntax. Plain input keeps the searcher's typeahead path.
+//! Structured expressions bind NOT before AND (including whitespace), then OR.
 
 use anyhow::{Result, bail};
 
@@ -75,242 +64,214 @@ pub(crate) struct PathTerm {
     pub phrase: bool,
 }
 
-/// 一个 AND 分组：`OR` 把整串切成若干组，**同一组内**的所有条件是 AND（合取）。
-///
-/// 这就落实了"AND 优先级高于 OR"——空格分隔的相邻条件先在组内 AND 到一起，
-/// `OR` 才把组与组并起来。各类条件分桶存放，建查询时分别翻译成 tantivy 子查询
-/// 再按 Must / MustNot 组合。
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct Group {
-    /// 正内容词，**保留引号原样**：直接交给 tantivy 的 `QueryParser`，让它自己
-    /// 决定是普通词还是 `"短语"`，不重复造一套短语解析。
-    pub content: Vec<String>,
-    /// 被排除的内容词（`-词` 或 `NOT 词`），同样保留引号原样交给 `QueryParser`，
-    /// 建查询时挂到 `Occur::MustNot`。
-    pub excluded: Vec<String>,
-    /// `path:` 路径过滤。
-    pub paths: Vec<PathTerm>,
-    /// `author:` 문서 속성 작성자 필터. 피연산자 형식은 `path:`와 같다.
-    pub authors: Vec<PathTerm>,
-    /// `title:` 문서 속성 제목 필터. 피연산자 형식은 `path:`와 같다.
-    pub titles: Vec<PathTerm>,
-    /// `mtime:` 时间过滤。
-    pub mtimes: Vec<DateBound>,
-    /// `size:` 体积过滤。
-    pub sizes: Vec<SizeBound>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TextField {
+    Name,
+    Body,
+    Path,
+    Author,
+    Title,
 }
 
-impl Group {
-    /// 组里一条有效条件都没有（可能是 `OR OR` 之间的空段）——这种空组要丢掉，
-    /// 不能让它变成一个"匹配任意文档"的空 BooleanQuery 把结果放宽。
-    fn is_empty(&self) -> bool {
-        self.content.is_empty()
-            && self.excluded.is_empty()
-            && self.paths.is_empty()
-            && self.authors.is_empty()
-            && self.titles.is_empty()
-            && self.mtimes.is_empty()
-            && self.sizes.is_empty()
-    }
-}
-
-/// 一次查询串解析的结果。
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Parsed {
-    /// 整串里到底有没有出现操作符。false 时 `groups` 一定为空，调用方应当忽略它、
-    /// 走老的"整串原样交给 QueryParser"路径，保证无操作符查询逐字节向后兼容。
-    pub has_operators: bool,
-    /// OR 分隔出来的各个 AND 组（已剔掉空组）。仅在 `has_operators` 为 true 时有意义。
-    pub groups: Vec<Group>,
+pub(crate) enum Expr<'a> {
+    Term(&'a str),
+    Text(TextField, PathTerm),
+    Ext(Vec<String>),
+    Mtime(DateBound),
+    Size(SizeBound),
+    Not(Box<Self>),
+    And(Vec<Self>),
+    Or(Vec<Self>),
 }
 
-/// 把查询串切成保留引号的顶层 token：空白分词，但一对双引号会把中间的空白保护起来
-/// 成为同一个 token（引号本身一并保留，好让上层区分"带引号的整体"和普通词）。
-///
-/// 这样 `path:"my docs"` 会整体成一个 token（引号在 `path:` 之后才打开，中间空格
-/// 被保护），`"unique marker"` 也是一个 token——分组和分类都在这个 token 粒度上做。
-fn tokenize(query: &str) -> Vec<String> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Token<'a> {
+    Term(&'a str),
+    And,
+    Or,
+    Not,
+    Open,
+    Close,
+}
+
+fn split_field(token: &str) -> Option<(&str, &str)> {
+    let (field, rest) = token.split_once(':')?;
+    (!field.is_empty() && field.bytes().all(|b| b.is_ascii_alphabetic()))
+        .then_some((field, rest))
+}
+
+fn known_field(field: &str) -> bool {
+    ["name", "body", "content", "ext", "path", "author", "title", "mtime", "size"]
+        .iter()
+        .any(|name| field.eq_ignore_ascii_case(name))
+}
+
+fn tokenize(mut input: &str) -> Result<Vec<Token<'_>>> {
     let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut in_quote = false;
-    let mut has = false;
-    for ch in query.chars() {
-        if ch == '"' {
-            in_quote = !in_quote;
-            cur.push(ch);
-            has = true;
-        } else if ch.is_whitespace() && !in_quote {
-            if has {
-                out.push(std::mem::take(&mut cur));
-                has = false;
-            }
-        } else {
-            cur.push(ch);
-            has = true;
+    loop {
+        input = input.trim_start();
+        if input.is_empty() {
+            return Ok(out);
         }
-    }
-    if has {
-        out.push(cur);
-    }
-    out
-}
-
-/// 把 `字段:剩余` 的 token 拆成（小写字段名, 剩余）。只有冒号前是非空、纯 ASCII
-/// 字母时才认作字段前缀——否则像 `12:30`、`http://x` 这种含冒号的普通词会被误判
-/// 成字段查询。字段名统一小写，好让 `PATH:`、`Path:` 也能被识别。
-fn split_field(token: &str) -> Option<(String, &str)> {
-    let colon = token.find(':')?;
-    let field = &token[..colon];
-    if field.is_empty() || !field.bytes().all(|b| b.is_ascii_alphabetic()) {
-        return None;
-    }
-    Some((field.to_ascii_lowercase(), &token[colon + 1..]))
-}
-
-/// 一个 token 是不是操作符（用来判断整串要不要走结构化解析）。
-///
-/// 注意大小写规则：`OR` / `NOT` **只有大写**才算操作符，小写 `or` / `not` 当普通词
-/// （英文文本里 or/not 太常见，大写才当连接词最不容易误伤）。`-词` 的前导减号、
-/// 以及 `path:` / `mtime:` / `size:` 三个已知字段前缀也都算操作符。
-fn is_operator_token(token: &str) -> bool {
-    if token == "OR" || token == "NOT" {
-        return true;
-    }
-    // 前导 `-` 且后面还有内容 → 排除操作符（单独一个 `-` 不算）。
-    if token.strip_prefix('-').is_some_and(|rest| !rest.is_empty()) {
-        return true;
-    }
-    matches!(
-        split_field(token),
-        Some((ref f, _))
-            if f == "path" || f == "mtime" || f == "size" || f == "author" || f == "title"
-    )
-}
-
-/// 剥掉操作数两端配对的双引号，返回（内层文本, 是否原本带引号）。
-fn unquote(s: &str) -> (String, bool) {
-    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
-        (s[1..s.len() - 1].to_string(), true)
-    } else {
-        (s.to_string(), false)
-    }
-}
-
-/// 解析查询串里的内联操作符。无操作符时返回 `has_operators: false`，让调用方走老路径。
-pub(crate) fn parse(query: &str) -> Result<Parsed> {
-    let tokens = tokenize(query);
-    if !tokens.iter().any(|t| is_operator_token(t)) {
-        // 没有任何操作符：不做结构化拆分，交回调用方按老逻辑整串解析，保证向后兼容。
-        return Ok(Parsed {
-            has_operators: false,
-            groups: Vec::new(),
-        });
-    }
-
-    // 先按大写 OR 把 token 流切成一组组；组内再逐个 token 分类。
-    let mut groups_tokens: Vec<Vec<&str>> = vec![Vec::new()];
-    for tok in &tokens {
-        if tok == "OR" {
-            groups_tokens.push(Vec::new());
-        } else {
-            groups_tokens
-                .last_mut()
-                .expect("至少有一组")
-                .push(tok.as_str());
-        }
-    }
-
-    let mut groups = Vec::new();
-    for gt in groups_tokens {
-        let group = classify_group(&gt)?;
-        // 空组（例如首尾多余的 OR、或 `OR OR` 之间）直接丢弃，不放宽结果。
-        if !group.is_empty() {
-            groups.push(group);
-        }
-    }
-    if groups.is_empty() {
-        bail!("查询里只有 OR / NOT 之类的连接词，没有实际的检索条件");
-    }
-
-    Ok(Parsed {
-        has_operators: true,
-        groups,
-    })
-}
-
-/// 把一组（OR 之间的一段）token 分类进 [`Group`] 的各个桶。非法操作数（如
-/// `mtime:>abc`）在这里就地报清晰中文错误，不会被静默当成普通词——静默会让用户
-/// 误以为过滤生效了。
-fn classify_group(tokens: &[&str]) -> Result<Group> {
-    let mut g = Group::default();
-    let mut i = 0;
-    while i < tokens.len() {
-        let tok = tokens[i];
-        i += 1;
-
-        // NOT 词：吃掉后面一个 token 作为排除项（保留引号交给 QueryParser 处理短语）。
-        if tok == "NOT" {
-            match tokens.get(i) {
-                Some(next) => {
-                    g.excluded.push((*next).to_string());
-                    i += 1;
-                }
-                None => bail!("NOT 后面缺少要排除的词，例如 `限流 NOT 废弃`"),
-            }
+        let punct = match input.as_bytes()[0] {
+            b'(' => Some(Token::Open),
+            b')' => Some(Token::Close),
+            b'-' if input[1..].starts_with(|ch: char| !ch.is_whitespace()) => Some(Token::Not),
+            _ => None,
+        };
+        if let Some(token) = punct {
+            out.push(token);
+            input = &input[1..];
             continue;
         }
 
-        // -词：前导减号排除。单独一个 `-` 不是操作数，忽略。
-        if let Some(rest) = tok.strip_prefix('-') {
-            if !rest.is_empty() {
-                g.excluded.push(rest.to_string());
-                continue;
+        let mut quoted = false;
+        let mut escaped = false;
+        let mut end = input.len();
+        for (i, ch) in input.char_indices() {
+            if escaped {
+                escaped = false;
+            } else if quoted && ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                quoted = !quoted;
+            } else if !quoted && (ch.is_whitespace() || matches!(ch, '(' | ')')) {
+                end = i;
+                break;
             }
         }
-
-        // 已知字段前缀。ext: 等未知字段一律落回内容词，原样交给 QueryParser
-        // （tantivy 本来就支持 `字段:词`，`ext:md` 这类既有写法保持不变）。
-        if let Some((field, rest)) = split_field(tok) {
-            match field.as_str() {
-                "path" => {
-                    let (operand, phrase) = unquote(rest);
-                    if operand.trim().is_empty() {
-                        bail!("path: 后面要跟路径关键词，例如 `path:报告` 或 `path:\"我的 文档\"`");
-                    }
-                    g.paths.push(PathTerm { operand, phrase });
-                    continue;
-                }
-                "author" | "title" => {
-                    let (operand, phrase) = unquote(rest);
-                    if operand.trim().is_empty() {
-                        bail!(
-                            "{field}: 뒤에 검색어가 필요합니다. 예: `{field}:홍길동` 또는 `{field}:\"분기 보고서\"`"
-                        );
-                    }
-                    let term = PathTerm { operand, phrase };
-                    if field == "author" {
-                        g.authors.push(term);
-                    } else {
-                        g.titles.push(term);
-                    }
-                    continue;
-                }
-                "mtime" => {
-                    g.mtimes.push(parse_date_bound(rest)?);
-                    continue;
-                }
-                "size" => {
-                    g.sizes.push(parse_size_bound(rest)?);
-                    continue;
-                }
-                _ => {}
-            }
+        if quoted {
+            bail!("닫는 큰따옴표가 필요합니다.");
         }
-
-        // 普通内容词（含 `"短语"`）：原样保留，交给 tantivy 的 QueryParser。
-        g.content.push(tok.to_string());
+        out.push(match &input[..end] {
+            "AND" => Token::And,
+            "OR" => Token::Or,
+            "NOT" => Token::Not,
+            text => Token::Term(text),
+        });
+        input = &input[end..];
     }
-    Ok(g)
+}
+
+pub(crate) fn parse(query: &str) -> Result<Option<Expr<'_>>> {
+    let tokens = tokenize(query)?;
+    if tokens.iter().all(|token| match token {
+        Token::Term(text) => !split_field(text).is_some_and(|(name, _)| known_field(name)),
+        _ => false,
+    }) {
+        return Ok(None);
+    }
+    let mut parser = Parser { remaining: &tokens };
+    let expr = parser.or(0)?;
+    if !parser.remaining.is_empty() {
+        bail!("여는 괄호 없이 닫는 괄호가 나왔습니다.");
+    }
+    Ok(Some(expr))
+}
+
+struct Parser<'a, 't> {
+    remaining: &'t [Token<'a>],
+}
+
+impl<'a> Parser<'a, '_> {
+    fn eat(&mut self, token: Token<'_>) -> bool {
+        if self.remaining.first().is_some_and(|next| *next == token) {
+            self.remaining = &self.remaining[1..];
+            true
+        } else {
+            false
+        }
+    }
+
+    fn or(&mut self, depth: usize) -> Result<Expr<'a>> {
+        let first = self.and(depth)?;
+        if !self.eat(Token::Or) {
+            return Ok(first);
+        }
+        let mut terms = vec![first];
+        loop {
+            terms.push(self.and(depth)?);
+            if !self.eat(Token::Or) {
+                return Ok(Expr::Or(terms));
+            }
+        }
+    }
+
+    fn and(&mut self, depth: usize) -> Result<Expr<'a>> {
+        let first = self.unary(depth)?;
+        if matches!(self.remaining.first(), None | Some(Token::Or | Token::Close)) {
+            return Ok(first);
+        }
+        let mut terms = vec![first];
+        loop {
+            self.eat(Token::And);
+            terms.push(self.unary(depth)?);
+            if matches!(self.remaining.first(), None | Some(Token::Or | Token::Close)) {
+                return Ok(Expr::And(terms));
+            }
+        }
+    }
+
+    fn unary(&mut self, depth: usize) -> Result<Expr<'a>> {
+        if depth >= 32 {
+            bail!("괄호와 제외 조건은 32단계 미만으로 입력하세요.");
+        }
+        if self.eat(Token::Not) {
+            return Ok(Expr::Not(Box::new(self.unary(depth + 1)?)));
+        }
+        if self.eat(Token::Open) {
+            let expr = self.or(depth + 1)?;
+            if !self.eat(Token::Close) {
+                bail!("닫는 괄호가 필요합니다.");
+            }
+            return Ok(expr);
+        }
+        if let Some((&Token::Term(term), rest)) = self.remaining.split_first() {
+            self.remaining = rest;
+            return parse_term(term);
+        }
+        bail!("검색어나 필드 조건이 필요합니다.");
+    }
+}
+
+fn parse_term(token: &str) -> Result<Expr<'_>> {
+    let Some((field, rest)) = split_field(token).filter(|(field, _)| known_field(field)) else {
+        return Ok(Expr::Term(token));
+    };
+    let field = field.to_ascii_lowercase();
+    let (operand, phrase) = match rest.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        Some(inner) => (inner, true),
+        None => (rest, false),
+    };
+    if operand.trim().is_empty() {
+        bail!("{field}: 뒤에 검색 조건을 입력하세요.");
+    }
+    let text_field = match field.as_str() {
+        "name" => TextField::Name,
+        "body" | "content" => TextField::Body,
+        "path" => TextField::Path,
+        "author" => TextField::Author,
+        "title" => TextField::Title,
+        "mtime" => return Ok(Expr::Mtime(parse_date_bound(operand)?)),
+        "size" => return Ok(Expr::Size(parse_size_bound(operand)?)),
+        "ext" => {
+            let mut exts = Vec::new();
+            for ext in operand.split(',').map(str::trim) {
+                let ext = ext.strip_prefix('.').unwrap_or(ext);
+                if ext.is_empty() || ext.chars().any(|ch| ch.is_whitespace() || ch == '.') {
+                    bail!("확장자를 `ext:pdf` 또는 `ext:pdf,docx`처럼 입력하세요.");
+                }
+                exts.push(ext.to_ascii_lowercase());
+            }
+            return Ok(Expr::Ext(exts));
+        }
+        _ => unreachable!("known field"),
+    };
+    Ok(Expr::Text(text_field, PathTerm {
+        operand: operand.to_owned(),
+        phrase,
+    }))
 }
 
 /// 从 `>=2026-01-01` 这类操作数里切出比较符和后面的实体，比较符缺失直接报错。
@@ -458,22 +419,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn no_operator_query_signals_passthrough() {
-        // 纯词、短语、ext: 都不算我们的操作符 → has_operators=false，走老路径。
-        for q in ["限流 中间件", "\"unique marker\"", "分布式", "ext:md 限流"] {
-            let parsed = parse(q).unwrap();
-            assert!(!parsed.has_operators, "查询 {q:?} 不该被判成含操作符");
-            assert!(parsed.groups.is_empty());
+    fn ordinary_words_and_quoted_operators_use_plain_search() {
+        for q in ["限流 中间件", "\"(AND OR NOT)\"", "cats or dogs", "shall not pass"] {
+            assert_eq!(parse(q).unwrap(), None, "{q}");
         }
-    }
-
-    #[test]
-    fn lowercase_or_and_not_are_plain_words() {
-        // 小写 or/not 是普通英文词，不当连接/排除操作符。
-        let parsed = parse("cats or dogs").unwrap();
-        assert!(!parsed.has_operators);
-        let parsed = parse("shall not pass").unwrap();
-        assert!(!parsed.has_operators);
     }
 
     #[test]
@@ -532,109 +481,13 @@ mod tests {
     }
 
     #[test]
-    fn or_splits_into_groups_and_space_is_and_within_group() {
-        let parsed = parse("限流 中间件 OR 熔断").unwrap();
-        assert!(parsed.has_operators);
-        assert_eq!(parsed.groups.len(), 2, "OR 应切成两组");
-        assert_eq!(parsed.groups[0].content, vec!["限流", "中间件"]);
-        assert_eq!(parsed.groups[1].content, vec!["熔断"]);
-    }
-
-    #[test]
-    fn exclusion_via_dash_and_not() {
-        let parsed = parse("限流 -废弃").unwrap();
-        assert_eq!(parsed.groups[0].content, vec!["限流"]);
-        assert_eq!(parsed.groups[0].excluded, vec!["废弃"]);
-
-        let parsed = parse("限流 NOT 废弃").unwrap();
-        assert_eq!(parsed.groups[0].content, vec!["限流"]);
-        assert_eq!(parsed.groups[0].excluded, vec!["废弃"]);
-    }
-
-    #[test]
-    fn path_operand_quoted_vs_bare() {
-        let parsed = parse("path:报告").unwrap();
-        assert_eq!(
-            parsed.groups[0].paths,
-            vec![PathTerm {
-                operand: "报告".to_string(),
-                phrase: false
-            }]
-        );
-
-        let parsed = parse("path:\"my docs\"").unwrap();
-        assert_eq!(
-            parsed.groups[0].paths,
-            vec![PathTerm {
-                operand: "my docs".to_string(),
-                phrase: true
-            }]
-        );
-    }
-
-    #[test]
-    fn combined_operators_in_one_group() {
-        let parsed = parse("限流 path:src mtime:>2026-01-01 size:<1mb -草稿").unwrap();
-        let g = &parsed.groups[0];
-        assert_eq!(g.content, vec!["限流"]);
-        assert_eq!(g.excluded, vec!["草稿"]);
-        assert_eq!(g.paths.len(), 1);
-        assert_eq!(g.mtimes.len(), 1);
-        assert_eq!(g.sizes.len(), 1);
-    }
-
-    #[test]
-    fn ext_prefix_stays_content_for_backward_compat() {
-        // ext: 不是我们接管的字段，但和别的操作符同现时要原样留在内容词里，
-        // 交给 tantivy QueryParser（它本就支持 ext:md）。
-        let parsed = parse("ext:md -草稿").unwrap();
-        assert!(parsed.has_operators);
-        assert_eq!(parsed.groups[0].content, vec!["ext:md"]);
-        assert_eq!(parsed.groups[0].excluded, vec!["草稿"]);
-    }
-
-    #[test]
-    fn author_and_title_operators_are_recognized() {
-        let parsed = parse("author:홍길동").unwrap();
-        assert!(parsed.has_operators);
-        assert_eq!(
-            parsed.groups[0].authors,
-            vec![PathTerm {
-                operand: "홍길동".into(),
-                phrase: false
-            }]
-        );
-        assert!(parsed.groups[0].content.is_empty());
-
-        let parsed = parse("배터리 TITLE:\"분기 보고서\" -초안").unwrap();
-        let g = &parsed.groups[0];
-        assert_eq!(g.content, vec!["배터리"]);
-        assert_eq!(
-            g.titles,
-            vec![PathTerm {
-                operand: "분기 보고서".into(),
-                phrase: true
-            }]
-        );
-        assert_eq!(g.excluded, vec!["초안"]);
-
-        let parsed = parse("author:kim OR author:lee").unwrap();
-        assert_eq!(parsed.groups.len(), 2);
-        assert_eq!(parsed.groups[1].authors[0].operand, "lee");
-
-        assert!(parse("author:").is_err(), "author: 빈 피연산자는 오류");
-        assert!(parse("title:\"\"").is_err(), "title: 빈 따옴표는 오류");
-    }
-
-    #[test]
-    fn empty_operand_errors() {
-        assert!(parse("path:").is_err(), "path: 空操作数应报错");
-        assert!(parse("path:\"\"").is_err(), "path 引号里为空应报错");
-    }
-
-    #[test]
-    fn only_connectives_errors() {
-        // 只有 NOT 缺被排除词、或只有 OR，都不是有效查询。
-        assert!(parse("NOT").is_err());
+    fn malformed_structured_queries_do_not_broaden_results() {
+        for q in [
+            "name:", "body:\"\"", "path:", "author:", "title:\"unfinished", "ext:pdf,",
+            "AND alpha", "alpha OR", "alpha OR OR beta", "alpha AND", "NOT",
+            "alpha AND (beta OR)", "alpha AND (beta", "alpha )", "()", "NOT )",
+        ] {
+            assert!(parse(q).is_err(), "{q}");
+        }
     }
 }

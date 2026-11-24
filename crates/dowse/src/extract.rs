@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::Read;
+use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use quick_xml::Reader;
@@ -9,14 +9,25 @@ use crate::rules::IndexRules;
 
 /// 按扩展名白名单认定的纯文本文件。
 const TEXT_EXTS: &[&str] = &[
-    "txt", "md", "markdown", "log", "csv", "tsv", "json", "toml", "yaml", "yml", "ini", "cfg",
-    "conf", "xml", "html", "htm", "sql", "sh", "ps1", "bat", "rs", "py", "go", "java", "js", "ts",
-    "jsx", "tsx", "c", "h", "cpp", "hpp", "cs", "rb", "php", "lua", "vue",
+    "txt", "md", "markdown", "mdc", "mmd", "mermaid", "drawio", "log", "csv", "tsv", "json",
+    "toml", "yaml", "yml", "ini", "cfg", "conf", "xml", "html", "htm", "sql", "sh", "ps1", "bat",
+    "rs", "py", "go", "java", "js", "ts", "jsx", "tsx", "c", "h", "cpp", "hpp", "cs", "rb", "php",
+    "lua", "vue",
 ];
 
-/// 支持抽取的 Office Open XML 格式（docx/xlsx/pptx，本质都是 zip 包）。
-/// 老式二进制格式 doc/xls/ppt 不在白名单里，天然被跳过——不做兼容。
-const OFFICE_EXTS: &[&str] = &["docx", "xlsx", "pptx"];
+/// 지원하는 Office 및 메일 아카이브 포맷(OOXML, `.xls`/`.xlsb`, 매크로 포함 `.docm`/`.xlsm`/`.pptm`, 아웃룩 `.pst`/`.ost`/`.msg`/`.eml`).
+const OFFICE_EXTS: &[&str] = &[
+    "docx", "docm", "xlsx", "xlsm", "xls", "xlsb", "pptx", "pptm", "pst", "ost", "msg", "eml",
+];
+
+pub(crate) fn builtin_extensions() -> impl Iterator<Item = &'static str> {
+    TEXT_EXTS
+        .iter()
+        .chain(OFFICE_EXTS)
+        .chain(crate::ocr::IMAGE_EXTS)
+        .copied()
+        .chain(["pdf"])
+}
 
 /// 这个文件是否属于能抽取文本的类型（只看扩展名，不读文件，很便宜）。
 /// 启动对账用它过滤：非文本类型的文件从来不会进索引，没必要参与三态比对——
@@ -34,6 +45,9 @@ pub(crate) fn is_extractable_with(path: &Path, rules: &IndexRules) -> bool {
         return false;
     };
     let ext = ext.to_ascii_lowercase();
+    if !rules.allows_extension(&ext) {
+        return false;
+    }
     ext == "pdf"
         || TEXT_EXTS.contains(&ext.as_str())
         || OFFICE_EXTS.contains(&ext.as_str())
@@ -89,8 +103,18 @@ fn extract_text_with(path: &Path, rules: &IndexRules) -> Option<String> {
 fn extract_document_with(path: &Path, rules: &IndexRules) -> Option<ExtractedDoc> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
 
+    if !rules.allows_extension(&ext) {
+        return None;
+    }
     let meta = fs::metadata(path).ok()?;
-    if meta.len() > rules.max_file_bytes() {
+    let size_limit = match ext.as_str() {
+        // PST/OST archives are read via bounded random-access seeks, never loaded whole into RAM.
+        "pst" | "ost" => 32 * 1024 * 1024 * 1024,
+        // Standalone .msg/.eml often carry large binary attachments while body text is tiny.
+        "msg" | "eml" => rules.max_file_bytes().max(100 * 1024 * 1024),
+        _ => rules.max_file_bytes(),
+    };
+    if meta.len() > size_limit {
         return None;
     }
 
@@ -120,17 +144,35 @@ fn extract_document_with(path: &Path, rules: &IndexRules) -> Option<ExtractedDoc
         let office = |text: Option<String>| {
             text.map(|text| ExtractedDoc {
                 text,
-                props: office_props(path),
+                props: fs::File::open(path)
+                    .ok()
+                    .and_then(|file| zip::ZipArchive::new(file).ok())
+                    .map(|mut zip| office_props(&mut zip))
+                    .unwrap_or_default(),
             })
         };
         match ext.as_str() {
             "pdf" => extract_pdf(path),
-            "docx" => office(extract_docx(path)),
-            "xlsx" => office(extract_xlsx(path)),
-            "pptx" => office(extract_pptx(path)),
-            e if TEXT_EXTS.contains(&e) => plain(read_text_smart(path)),
+            "docx" | "docm" => office(extract_docx(fs::File::open(path).ok()?)),
+            "xlsx" | "xlsm" | "xls" | "xlsb" => {
+                office(extract_spreadsheet(BufReader::new(fs::File::open(path).ok()?), &ext))
+            }
+            "pptx" | "pptm" => office(extract_pptx(fs::File::open(path).ok()?)),
+            "pst" | "ost" => crate::pst::extract_pst_archive(path).map(|a| ExtractedDoc {
+                text: a.summary_text,
+                props: DocProps::default(),
+            }),
+            "msg" => crate::pst::extract_msg(path),
+            "eml" => crate::pst::extract_eml(path),
+            "html" | "htm" => extract_html(path),
+            "csv" | "tsv" => plain(extract_delimited_text(path)),
+            e if TEXT_EXTS.contains(&e) => {
+                plain(read_text_smart(path).map(|s| truncate_utf8(s, 512 * 1024)))
+            }
             // 追加白名单里的扩展名当纯文本读（自动探测编码），跟内建文本类型同路。
-            e if rules.is_extra_text_ext(e) => plain(read_text_smart(path)),
+            e if rules.is_extra_text_ext(e) => {
+                plain(read_text_smart(path).map(|s| truncate_utf8(s, 512 * 1024)))
+            }
             _ => None,
         }
     }))
@@ -138,24 +180,108 @@ fn extract_document_with(path: &Path, rules: &IndexRules) -> Option<ExtractedDoc
     .flatten()
 }
 
-/// 从 PDF 抽文本和 Info 속성。畸形 PDF 触发的 panic 由 `extract_text` 那层统一的
-/// `catch_unwind` 兜底（见其文档），这里只走正常路径：出错时落成 `None`。
-/// 跟 `pdf_extract::extract_text` 同一流程（加载 → 空密码解密 → 输出纯文本），
-/// 只是自己持有 `Document`，好顺手读 trailer 里的 Info 사전，不必把文件读两遍。
+const MAX_OFFICE_EXPANDED_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_OFFICE_XML_BYTES: u64 = 128 * 1024 * 1024;
+
+fn office_archive<R: Read + Seek>(input: R, limit: u64) -> Option<zip::ZipArchive<R>> {
+    let archive = zip::ZipArchive::new(input).ok()?;
+    // The central directory has final sizes even when entries use data descriptors.
+    let mut remaining = limit;
+    for i in 0..archive.len() {
+        remaining = remaining.checked_sub(archive.by_index_data(i).ok()?.size())?;
+    }
+    Some(archive)
+}
+
+fn read_office_xml(entry: impl Read) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    entry.take(MAX_OFFICE_XML_BYTES + 1).read_to_end(&mut bytes).ok()?;
+    (bytes.len() as u64 <= MAX_OFFICE_XML_BYTES).then_some(bytes)
+}
+
+pub(crate) fn attachment_extension(name: &str) -> Option<String> {
+    let ext = Path::new(name).extension()?.to_str()?.to_ascii_lowercase();
+    matches!(
+        ext.as_str(),
+        "pdf" | "docx" | "docm" | "xlsx" | "xlsm" | "xls" | "xlsb" | "pptx" | "pptm" | "txt" | "md"
+    ).then_some(ext)
+}
+
+pub(crate) fn extract_attachment(
+    ext: &str,
+    bytes: &[u8],
+    max_text_bytes: usize,
+) -> Option<ExtractedDoc> {
+    std::panic::catch_unwind(|| {
+        let mut props = DocProps::default();
+        if matches!(ext, "docx" | "docm" | "xlsx" | "xlsm" | "xlsb" | "pptx" | "pptm") {
+            let mut zip = office_archive(Cursor::new(bytes), 128 * 1024 * 1024)?;
+            props = office_props(&mut zip);
+        }
+        let text = match ext {
+            "pdf" => {
+                let mut doc = pdf_extract::Document::load_mem(bytes).ok()?;
+                if doc.is_encrypted() {
+                    doc.decrypt("").ok()?;
+                }
+                props = pdf_props(&doc);
+                extract_pdf_pages(&doc, max_text_bytes)
+            }
+            "docx" | "docm" => extract_docx(Cursor::new(bytes)).unwrap_or_default(),
+            "xlsx" | "xlsm" | "xls" | "xlsb" => {
+                extract_spreadsheet(Cursor::new(bytes), ext).unwrap_or_default()
+            }
+            "pptx" | "pptm" => extract_pptx(Cursor::new(bytes)).unwrap_or_default(),
+            "txt" | "md" => decode_bytes_with_codepage(bytes, 0),
+            _ => return None,
+        };
+        Some(ExtractedDoc { text: truncate_utf8(text, max_text_bytes), props })
+    }).ok().flatten()
+}
+
+fn truncate_utf8(mut s: String, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut cut = max_bytes;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    s.truncate(cut);
+    s
+}
+
+/// 从 PDF 抽文本和 Info 속성。单页解析失败时仅跳过该页，保留其余正常页面的文本。
 fn extract_pdf(path: &Path) -> Option<ExtractedDoc> {
     let mut doc = pdf_extract::Document::load(path).ok()?;
     if doc.is_encrypted() {
         doc.decrypt("").ok()?;
     }
-    let mut text = String::new();
-    {
-        let mut output = pdf_extract::PlainTextOutput::new(&mut text);
-        pdf_extract::output_doc(&doc, &mut output).ok()?;
-    }
     Some(ExtractedDoc {
-        text,
+        text: extract_pdf_pages(&doc, usize::MAX),
         props: pdf_props(&doc),
     })
+}
+
+fn extract_pdf_pages(doc: &pdf_extract::Document, max_text_bytes: usize) -> String {
+    let mut text = String::new();
+    for number in doc.get_pages().keys() {
+        let mut page = String::new();
+        if pdf_extract::output_doc_page(
+            doc,
+            &mut pdf_extract::PlainTextOutput::new(&mut page),
+            *number,
+        )
+        .is_ok()
+            && !page.trim().is_empty()
+        {
+            text.push_str(&format!("## 페이지 {number}\n{page}\n\n"));
+            if text.len() >= max_text_bytes {
+                break;
+            }
+        }
+    }
+    text
 }
 
 /// PDF trailer의 `/Info` 사전에서 문서 속성을 읽는다.
@@ -201,8 +327,13 @@ fn decode_pdf_text_string(bytes: &[u8]) -> String {
 }
 
 /// docx/xlsx/pptx 공통: `docProps/core.xml`에서 속성을 읽는다. 항목이 없으면 기본값.
-fn office_props(path: &Path) -> DocProps {
-    let Some(xml) = read_zip_entry(path, "docProps/core.xml") else {
+fn office_props(archive: &mut zip::ZipArchive<impl Read + Seek>) -> DocProps {
+    let Some(xml) = (|| {
+        let entry = archive.by_name("docProps/core.xml").ok()?;
+        let mut xml = Vec::new();
+        entry.take(256 * 1024 + 1).read_to_end(&mut xml).ok()?;
+        (xml.len() <= 256 * 1024).then_some(xml)
+    })() else {
         return DocProps::default();
     };
     let field = |tag: &[u8]| non_empty(extract_tagged_text(&xml, tag, None));
@@ -354,93 +485,601 @@ fn parse_pdf_date(s: &str) -> Option<i64> {
     to_epoch_millis(parts, 0, offset)
 }
 
-/// 打开一个 zip 包里的单个条目，读成字节。条目不存在/包本身打不开（损坏、
-/// 加密）都走 None——密码保护的 Office 文件会在这里打不开 zip 结构，
-/// 自然跳过，不会 panic。
-fn read_zip_entry(path: &Path, entry_name: &str) -> Option<Vec<u8>> {
-    let file = fs::File::open(path).ok()?;
-    let mut archive = zip::ZipArchive::new(file).ok()?;
-    let mut entry = archive.by_name(entry_name).ok()?;
-    let mut bytes = Vec::new();
-    entry.read_to_end(&mut bytes).ok()?;
-    Some(bytes)
+/// docx/docm 본문(`word/document.xml`)과 부속 파트(머리글·바닥글·각주·미주·메모)를 추출한다.
+fn extract_docx(input: impl Read + Seek) -> Option<String> {
+    let mut archive = office_archive(input, MAX_OFFICE_EXPANDED_BYTES)?;
+    let doc_bytes = read_office_xml(archive.by_name("word/document.xml").ok()?)?;
+    let mut parts = Vec::new();
+    let main_text = extract_tagged_text(&doc_bytes, b"t", Some(b"p"));
+    let main_trimmed = main_text.trim();
+    if !main_trimmed.is_empty() {
+        parts.push(main_trimmed.to_string());
+    }
+
+    let extra_names: Vec<String> = archive
+        .file_names()
+        .filter_map(Result::ok)
+        .filter(|n| {
+            n.ends_with(".xml")
+                && (n.starts_with("word/header")
+                    || n.starts_with("word/footer")
+                    || *n == "word/footnotes.xml"
+                    || *n == "word/endnotes.xml"
+                    || *n == "word/comments.xml")
+        })
+        .map(std::borrow::Cow::into_owned)
+        .collect();
+
+    for name in extra_names {
+        if let Some(buf) = archive.by_name(&name).ok().and_then(read_office_xml) {
+            let extra = extract_tagged_text(&buf, b"t", Some(b"p"));
+            let extra_trimmed = extra.trim();
+            if !extra_trimmed.is_empty() {
+                parts.push(extra_trimmed.to_string());
+            }
+        }
+    }
+
+    (!parts.is_empty()).then(|| parts.join("\n"))
 }
 
-/// docx 是一个 zip 包，正文全部在 word/document.xml 里，文本节点是 `<w:t>`。
-/// 段落 `<w:p>` 闭合时补一个换行，避免不同段落的文字连成一整块无法阅读。
-fn extract_docx(path: &Path) -> Option<String> {
-    let xml = read_zip_entry(path, "word/document.xml")?;
-    let text = extract_tagged_text(&xml, b"t", Some(b"p"));
-    let text = text.trim();
-    (!text.is_empty()).then(|| text.to_string())
+fn is_numeric_or_timestamp_str(s: &str) -> bool {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    if trimmed.parse::<f64>().is_ok() {
+        return true;
+    }
+    // Common numeric/timestamp/hex/unit forms like "2026-11-19 10:20:30", "98.4%", "#N/A"
+    let mut digits = 0usize;
+    let mut letters = 0usize;
+    for ch in trimmed.chars() {
+        if ch.is_ascii_digit() {
+            digits += 1;
+        } else if ch.is_alphabetic() {
+            letters += 1;
+        }
+    }
+    digits > 0 && letters <= 1 && trimmed.len() <= 32
 }
 
-/// xlsx 的单元格文本绝大多数不直接存在 sheet 里，而是去重后存进
-/// xl/sharedStrings.xml，sheet 里只留索引号；覆盖不了共享字符串表的是
-/// 内联字符串（`<c t="inlineStr"><is><t>...</t></is></c>`），直接写在各
-/// xl/worksheets/sheet*.xml 里，两处都要读。两处的文本节点本地名都是 `<t>`。
-fn extract_xlsx(path: &Path) -> Option<String> {
-    let file = fs::File::open(path).ok()?;
-    let mut archive = zip::ZipArchive::new(file).ok()?;
+/// 시트 단위로 '문서형 시트'와 'RAW 데이터 테이블 시트'를 자동 판별해 추출한다.
+/// - 문서형 시트(소규모 표, 회의록, 체크리스트, 사양서 등): 빈 셀을 제거하고 본문 전체를 보존.
+/// - RAW 데이터 시트(수백~수십만 행의 측정치·로그·DB 테이블): 시트명 + 헤더 행 + 고유 문자열 범주 + 상위 표본 행만 요약 색인.
+fn extract_spreadsheet(mut input: impl std::io::BufRead + Seek, ext: &str) -> Option<String> {
+    use calamine::{Data, Reader, Sheets, Xls, Xlsb, Xlsx};
+    use std::collections::HashSet;
 
+    const MAX_SCAN_ROWS: usize = 50_000;
+    const DOC_SHEET_MAX_BYTES: usize = 200_000;
+    const MAX_UNIQUE_CATEGORIES: usize = 120;
+
+    if ext != "xls" {
+        office_archive(&mut input, MAX_OFFICE_EXPANDED_BYTES)?;
+        input.rewind().ok()?;
+    }
+
+    let book = match ext {
+        "xls" => Xls::new(&mut input).map(Sheets::Xls).ok(),
+        "xlsb" => Xlsb::new(&mut input).map(Sheets::Xlsb).ok(),
+        _ => Xlsx::new(&mut input).map(Sheets::Xlsx).ok(),
+    };
+    if let Some(mut book) = book {
+        let mut out = String::new();
+        for sheet in book.sheet_names() {
+            let Ok(range) = book.worksheet_range(&sheet) else {
+                continue;
+            };
+
+            let mut non_empty_rows = 0usize;
+            let mut max_cols = 0usize;
+            let mut numeric_cells = 0usize;
+            let mut prose_cells = 0usize;
+
+            // Sample up to 350 non-empty rows first to classify cleanly while scanning.
+            for row in range.rows().take(MAX_SCAN_ROWS) {
+                let mut row_non_empty = 0usize;
+                for cell in row {
+                    match cell {
+                        Data::Empty => {}
+                        Data::Int(_)
+                        | Data::Float(_)
+                        | Data::Bool(_)
+                        | Data::DateTime(_)
+                        | Data::DateTimeIso(_)
+                        | Data::DurationIso(_)
+                        | Data::Error(_) => {
+                            row_non_empty += 1;
+                            numeric_cells += 1;
+                        }
+                        Data::String(s) => {
+                            let t = s.trim();
+                            if !t.is_empty() {
+                                row_non_empty += 1;
+                                if is_numeric_or_timestamp_str(t) {
+                                    numeric_cells += 1;
+                                } else {
+                                    prose_cells += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                if row_non_empty > 0 {
+                    non_empty_rows += 1;
+                    max_cols = max_cols.max(row_non_empty);
+                }
+            }
+
+            if non_empty_rows == 0 {
+                continue;
+            }
+
+            let total_cells = (numeric_cells + prose_cells).max(1);
+            let numeric_ratio = numeric_cells as f64 / total_cells as f64;
+            let is_raw_table = non_empty_rows > 800
+                || (non_empty_rows > 150 && numeric_ratio >= 0.65)
+                || (total_cells > 4_000 && numeric_ratio >= 0.70);
+
+            if !is_raw_table {
+                out.push_str(&format!("\n## {sheet}\n"));
+                let sheet_start = out.len();
+                for row in range.rows() {
+                    let cells: Vec<String> = row
+                        .iter()
+                        .filter_map(|c| match c {
+                            Data::Empty => None,
+                            other => {
+                                let s = other.to_string();
+                                let t = s.trim();
+                                (!t.is_empty()).then(|| t.to_string())
+                            }
+                        })
+                        .collect();
+                    if !cells.is_empty() {
+                        out.push_str(&cells.join("\t"));
+                        out.push('\n');
+                        if out.len() - sheet_start >= DOC_SHEET_MAX_BYTES {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                out.push_str(&format!(
+                    "\n## {sheet} [데이터 시트 요약: {}행 × {}열, 수치 비중 {:.0}%]\n",
+                    non_empty_rows,
+                    max_cols,
+                    numeric_ratio * 100.0
+                ));
+
+                let mut header_rows = Vec::new();
+                let mut sample_rows = Vec::new();
+                let mut categories = Vec::new();
+                let mut seen_cat = HashSet::new();
+
+                for row in range.rows().take(5_000) {
+                    let non_empty: Vec<&Data> =
+                        row.iter().filter(|c| !matches!(c, Data::Empty)).collect();
+                    if non_empty.is_empty() {
+                        continue;
+                    }
+                    if header_rows.len() < 3 {
+                        let line = non_empty
+                            .iter()
+                            .take(64)
+                            .map(|c| c.to_string())
+                            .collect::<Vec<_>>()
+                            .join("\t");
+                        header_rows.push(line);
+                    } else if sample_rows.len() < 5 {
+                        let line = non_empty
+                            .iter()
+                            .take(16)
+                            .map(|c| c.to_string())
+                            .collect::<Vec<_>>()
+                            .join("\t");
+                        sample_rows.push(line);
+                    }
+
+                    if categories.len() < MAX_UNIQUE_CATEGORIES {
+                        for c in non_empty {
+                            if let Data::String(s) = c {
+                                let t = s.trim();
+                                let char_cnt = t.chars().count();
+                                if (2..=80).contains(&char_cnt)
+                                    && !is_numeric_or_timestamp_str(t)
+                                    && seen_cat.insert(t.to_lowercase())
+                                {
+                                    categories.push(t.to_string());
+                                    if categories.len() >= MAX_UNIQUE_CATEGORIES {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !header_rows.is_empty() {
+                    out.push_str("컬럼/헤더:\n");
+                    for h in header_rows {
+                        out.push_str(&h);
+                        out.push('\n');
+                    }
+                }
+                if !categories.is_empty() {
+                    out.push_str("주요 항목: ");
+                    out.push_str(&categories.join(", "));
+                    out.push('\n');
+                }
+                if !sample_rows.is_empty() {
+                    out.push_str("표본 행:\n");
+                    for sr in sample_rows {
+                        out.push_str(&sr);
+                        out.push('\n');
+                    }
+                }
+            }
+        }
+        let trimmed = out.trim();
+        if !trimmed.is_empty() {
+            return Some(out);
+        }
+    }
+
+    if !matches!(ext, "xlsx" | "xlsm") {
+        return None;
+    }
+
+    // Minimal/corrupted OOXML zip fallback when calamine workbook metadata is incomplete.
+    input.seek(SeekFrom::Start(0)).ok()?;
+    let mut archive = office_archive(input, MAX_OFFICE_EXPANDED_BYTES)?;
     let mut text = String::new();
 
-    if let Ok(mut entry) = archive.by_name("xl/sharedStrings.xml") {
-        let mut bytes = Vec::new();
-        if entry.read_to_end(&mut bytes).is_ok() {
-            drop(entry);
-            text.push_str(&extract_tagged_text(&bytes, b"t", None));
-            text.push('\n');
-        }
+    if let Some(bytes) = archive.by_name("xl/sharedStrings.xml").ok().and_then(read_office_xml) {
+        text.push_str(&extract_tagged_text(&bytes, b"t", None));
+        text.push('\n');
     }
 
     let sheet_names: Vec<String> = archive
         .file_names()
+        .filter_map(Result::ok)
         .filter(|n| n.starts_with("xl/worksheets/sheet") && n.ends_with(".xml"))
-        .map(|n| n.to_string())
+        .map(std::borrow::Cow::into_owned)
         .collect();
     for name in sheet_names {
-        let Ok(mut entry) = archive.by_name(&name) else {
+        let Some(bytes) = archive.by_name(&name).ok().and_then(read_office_xml) else {
             continue;
         };
-        let mut bytes = Vec::new();
-        if entry.read_to_end(&mut bytes).is_err() {
-            continue;
-        }
-        drop(entry);
         text.push_str(&extract_tagged_text(&bytes, b"t", None));
         text.push('\n');
     }
 
     let text = text.trim();
-    (!text.is_empty()).then(|| text.to_string())
+    (!text.is_empty()).then(|| truncate_utf8(text.to_string(), 256 * 1024))
 }
 
-/// pptx 每页幻灯片是独立的 ppt/slides/slideN.xml，文本 run 是 `<a:t>`，
-/// 本地名同样是 `t`。幻灯片之间补空行分隔。
-fn extract_pptx(path: &Path) -> Option<String> {
-    let file = fs::File::open(path).ok()?;
-    let mut archive = zip::ZipArchive::new(file).ok()?;
+fn extract_delimited_text(path: &Path) -> Option<String> {
+    use std::collections::HashSet;
 
-    let mut slide_names: Vec<String> = archive
-        .file_names()
-        .filter(|n| n.starts_with("ppt/slides/slide") && n.ends_with(".xml"))
-        .map(|n| n.to_string())
-        .collect();
-    slide_names.sort();
+    let raw = read_text_smart(path)?;
+    let non_empty_lines: Vec<&str> = raw.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if non_empty_lines.is_empty() {
+        return None;
+    }
+    if non_empty_lines.len() <= 200 && raw.len() <= 64 * 1024 {
+        return Some(raw);
+    }
 
-    let mut text = String::new();
-    for name in slide_names {
-        let Ok(mut entry) = archive.by_name(&name) else {
-            continue;
-        };
-        let mut bytes = Vec::new();
-        if entry.read_to_end(&mut bytes).is_err() {
+    let delim = if path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("tsv"))
+    {
+        '\t'
+    } else {
+        ','
+    };
+
+    let mut num_cells = 0usize;
+    let mut txt_cells = 0usize;
+    for line in non_empty_lines.iter().take(300) {
+        for tok in line.split(delim) {
+            let t = tok.trim().trim_matches('"');
+            if t.is_empty() {
+                continue;
+            }
+            if is_numeric_or_timestamp_str(t) {
+                num_cells += 1;
+            } else {
+                txt_cells += 1;
+            }
+        }
+    }
+    let ratio = num_cells as f64 / (num_cells + txt_cells).max(1) as f64;
+    let is_raw_table = non_empty_lines.len() > 800 || (non_empty_lines.len() > 200 && ratio >= 0.65);
+    if !is_raw_table {
+        return Some(truncate_utf8(raw, 256 * 1024));
+    }
+
+    let mut out = format!(
+        "[데이터 파일 요약: {}행, 수치 비중 {:.0}%]\n",
+        non_empty_lines.len(),
+        ratio * 100.0
+    );
+    out.push_str("컬럼/헤더:\n");
+    for h in non_empty_lines.iter().take(3) {
+        out.push_str(&truncate_utf8((*h).to_string(), 1024));
+        out.push('\n');
+    }
+
+    let mut categories = Vec::new();
+    let mut seen = HashSet::new();
+    for line in non_empty_lines.iter().skip(1).take(5_000) {
+        for tok in line.split(delim) {
+            let t = tok.trim().trim_matches('"');
+            let char_cnt = t.chars().count();
+            if (2..=80).contains(&char_cnt)
+                && !is_numeric_or_timestamp_str(t)
+                && seen.insert(t.to_lowercase())
+            {
+                categories.push(t.to_string());
+                if categories.len() >= 120 {
+                    break;
+                }
+            }
+        }
+        if categories.len() >= 120 {
+            break;
+        }
+    }
+    if !categories.is_empty() {
+        out.push_str("주요 항목: ");
+        out.push_str(&categories.join(", "));
+        out.push('\n');
+    }
+    out.push_str("표본 행:\n");
+    for s in non_empty_lines.iter().skip(3).take(5) {
+        out.push_str(&truncate_utf8((*s).to_string(), 512));
+        out.push('\n');
+    }
+    Some(out)
+}
+
+pub(crate) fn clean_html_fragment(raw: &str) -> String {
+    extract_html_str(raw).map(|(text, _)| text).unwrap_or_default()
+}
+
+fn extract_html(path: &Path) -> Option<ExtractedDoc> {
+    let raw = read_text_smart(path)?;
+    let (text, title) = extract_html_str(&raw)?;
+    Some(ExtractedDoc {
+        text,
+        props: DocProps {
+            title,
+            ..DocProps::default()
+        },
+    })
+}
+
+fn extract_html_str(raw: &str) -> Option<(String, Option<String>)> {
+    let bytes = raw.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(raw.len().min(128 * 1024));
+    let mut title_buf = String::new();
+    let mut in_title = false;
+    let mut i = 0usize;
+
+    while i < len {
+        if bytes[i] == b'<' {
+            if raw[i..].starts_with("<!--") {
+                if let Some(end) = raw[i + 4..].find("-->") {
+                    i += 4 + end + 3;
+                    continue;
+                }
+                break;
+            }
+            let Some(rel_close) = raw[i + 1..].find('>') else {
+                break;
+            };
+            let tag_inner = raw[i + 1..i + 1 + rel_close].trim();
+            let is_closing = tag_inner.starts_with('/');
+            let name_slice = tag_inner.trim_start_matches('/');
+            let tag_name: String = name_slice
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric())
+                .map(|c| c.to_ascii_lowercase())
+                .collect();
+            let self_closing = tag_inner.ends_with('/');
+            i += 1 + rel_close + 1;
+
+            if !is_closing
+                && !self_closing
+                && matches!(tag_name.as_str(), "script" | "style" | "noscript" | "svg")
+            {
+                let needle = format!("</{tag_name}");
+                let rest_lower = raw[i..].to_ascii_lowercase();
+                if let Some(pos) = rest_lower.find(&needle) {
+                    i += pos;
+                    if let Some(gt) = raw[i..].find('>') {
+                        i += gt + 1;
+                    }
+                    continue;
+                }
+                break;
+            }
+
+            if tag_name == "title" {
+                in_title = !is_closing && !self_closing;
+                continue;
+            }
+
+            if matches!(
+                tag_name.as_str(),
+                "p" | "div"
+                    | "br"
+                    | "tr"
+                    | "li"
+                    | "h1"
+                    | "h2"
+                    | "h3"
+                    | "h4"
+                    | "h5"
+                    | "h6"
+                    | "section"
+                    | "article"
+                    | "header"
+                    | "footer"
+                    | "blockquote"
+                    | "pre"
+                    | "hr"
+            ) {
+                if !out.ends_with('\n') && !out.is_empty() {
+                    out.push('\n');
+                }
+            } else if matches!(tag_name.as_str(), "td" | "th")
+                && is_closing
+                && !out.ends_with(['\t', '\n'])
+            {
+                out.push('\t');
+            }
             continue;
         }
-        drop(entry);
-        text.push_str(&extract_tagged_text(&bytes, b"t", Some(b"p")));
-        text.push('\n');
+
+        let next_lt = raw[i..].find('<').map(|p| i + p).unwrap_or(len);
+        let decoded = decode_html_entities(&raw[i..next_lt]);
+        if in_title {
+            title_buf.push_str(&decoded);
+        } else {
+            for ch in decoded.chars() {
+                if ch == '\r' {
+                    continue;
+                }
+                if ch == '\n' {
+                    if !out.ends_with("\n\n") && !out.is_empty() {
+                        out.push('\n');
+                    }
+                } else if ch.is_whitespace() {
+                    if !out.ends_with([' ', '\t', '\n']) && !out.is_empty() {
+                        out.push(' ');
+                    }
+                } else {
+                    out.push(ch);
+                }
+            }
+        }
+        i = next_lt;
+        if out.len() >= 384 * 1024 {
+            break;
+        }
+    }
+
+    let text = out.trim().to_string();
+    if text.is_empty() && title_buf.trim().is_empty() {
+        return None;
+    }
+    let final_text = if text.is_empty() {
+        title_buf.trim().to_string()
+    } else {
+        text
+    };
+    Some((final_text, non_empty(title_buf)))
+}
+
+fn decode_html_entities(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp + 1..];
+        if let Some(semi) = after.bytes().take(12).position(|b| b == b';') {
+            let ent = &after[..semi];
+            let replaced = match ent {
+                "nbsp" | "#160" | "#xa0" | "#xA0" => Some(' '),
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" | "#39" => Some('\''),
+                _ if ent.starts_with("#x") || ent.starts_with("#X") => {
+                    u32::from_str_radix(&ent[2..], 16).ok().and_then(char::from_u32)
+                }
+                _ if ent.starts_with('#') => ent[1..].parse::<u32>().ok().and_then(char::from_u32),
+                _ => None,
+            };
+            if let Some(ch) = replaced {
+                out.push(ch);
+                rest = &after[semi + 1..];
+                continue;
+            }
+        }
+        out.push('&');
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// pptx/pptm 슬라이드 본문(`ppt/slides/slideN.xml`), 발표자 노트(`notesSlideN.xml`), 다이어그램(`diagrams/data*.xml`) 추출.
+fn extract_pptx(input: impl Read + Seek) -> Option<String> {
+    let mut archive = office_archive(input, MAX_OFFICE_EXPANDED_BYTES)?;
+
+    let mut slide_nums: Vec<(u32, String)> = archive
+        .file_names()
+        .filter_map(Result::ok)
+        .filter(|n| n.starts_with("ppt/slides/slide") && n.ends_with(".xml"))
+        .map(|n| {
+            let num = n
+                .trim_start_matches("ppt/slides/slide")
+                .trim_end_matches(".xml")
+                .parse::<u32>()
+                .unwrap_or(u32::MAX);
+            (num, n.into_owned())
+        })
+        .collect();
+    slide_nums.sort_by_key(|(num, _)| *num);
+
+    let diagram_names: Vec<String> = archive
+        .file_names()
+        .filter_map(Result::ok)
+        .filter(|n| n.starts_with("ppt/diagrams/data") && n.ends_with(".xml"))
+        .map(std::borrow::Cow::into_owned)
+        .collect();
+
+    let mut text = String::new();
+    for (idx, (slide_num, name)) in slide_nums.into_iter().enumerate() {
+        text.push_str(&format!("\n## 슬라이드 {}\n", idx + 1));
+        if let Some(bytes) = archive.by_name(&name).ok().and_then(read_office_xml) {
+            text.push_str(&extract_tagged_text(&bytes, b"t", Some(b"p")));
+            text.push('\n');
+        }
+        if slide_num != u32::MAX {
+            let note_name = format!("ppt/notesSlides/notesSlide{slide_num}.xml");
+            if let Some(note_bytes) = archive.by_name(&note_name).ok().and_then(read_office_xml) {
+                let note_txt = extract_tagged_text(&note_bytes, b"t", Some(b"p"));
+                let trimmed = note_txt.trim();
+                if !trimmed.is_empty() {
+                    text.push_str(trimmed);
+                    text.push('\n');
+                }
+            }
+        }
+    }
+
+    for diag in diagram_names {
+        if let Some(bytes) = archive.by_name(&diag).ok().and_then(read_office_xml) {
+            let diag_txt = extract_tagged_text(&bytes, b"t", Some(b"p"));
+            let trimmed = diag_txt.trim();
+            if !trimmed.is_empty() {
+                text.push('\n');
+                text.push_str(trimmed);
+                text.push('\n');
+            }
+        }
     }
 
     let text = text.trim();
@@ -515,22 +1154,40 @@ fn extract_tagged_text(xml: &[u8], text_tag: &[u8], para_tag: Option<&[u8]>) -> 
 /// 读文本文件，自动探测编码。
 /// Windows 上的中文 txt 很多是 GBK 而不是 UTF-8，直接按 UTF-8 读会变乱码，
 /// 所以先用 chardetng 猜编码，再用 encoding_rs 解码成 UTF-8。
+pub(crate) fn decode_bytes_with_codepage(bytes: &[u8], codepage: u32) -> String {
+    if bytes.is_empty() {
+        return String::new();
+    }
+    let explicit_enc = match codepage {
+        65001 => Some(encoding_rs::UTF_8),
+        949 | 51949 => Some(encoding_rs::EUC_KR),
+        936 | 54936 => Some(encoding_rs::GB18030),
+        950 => Some(encoding_rs::BIG5),
+        932 => Some(encoding_rs::SHIFT_JIS),
+        1252 | 28591 => Some(encoding_rs::WINDOWS_1252),
+        _ => None,
+    };
+    if let Some(enc) = explicit_enc {
+        let (cow, _, _) = enc.decode(bytes);
+        return cow.into_owned();
+    }
+
+    let mut detector = chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Allow);
+    detector.feed(bytes, true);
+    let encoding = detector.guess(None, chardetng::Utf8Detection::Allow);
+    let (text, _, had_errors) = encoding.decode(bytes);
+    if had_errors && encoding != encoding_rs::UTF_8 {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    text.into_owned()
+}
+
 fn read_text_smart(path: &Path) -> Option<String> {
     let bytes = fs::read(path).ok()?;
     if bytes.is_empty() {
         return None;
     }
-
-    let mut detector = chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Allow);
-    detector.feed(&bytes, true);
-    let encoding = detector.guess(None, chardetng::Utf8Detection::Allow);
-
-    let (text, _, had_errors) = encoding.decode(&bytes);
-    if had_errors && encoding != encoding_rs::UTF_8 {
-        // 猜错编码时宁可退回 UTF-8 有损解码，也不索引一堆乱码词条
-        return Some(String::from_utf8_lossy(&bytes).into_owned());
-    }
-    Some(text.into_owned())
+    Some(decode_bytes_with_codepage(&bytes, 0))
 }
 
 #[cfg(test)]
@@ -552,6 +1209,20 @@ mod tests {
             zip.write_all(content.as_bytes()).unwrap();
         }
         zip.finish().unwrap();
+    }
+
+    #[test]
+    fn office_archive_limits_total_expanded_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sample.docx");
+        let parts = [
+            ("word/document.xml", "<t>Document</t>"),
+            ("word/header1.xml", "<t>Header</t>"),
+        ];
+        write_zip(&path, &parts);
+        let size = parts.iter().map(|(_, text)| text.len() as u64).sum::<u64>();
+        assert!(office_archive(fs::File::open(&path).unwrap(), size - 1).is_none());
+        assert!(office_archive(fs::File::open(&path).unwrap(), size).is_some());
     }
 
     #[test]
@@ -1038,5 +1709,47 @@ mod tests {
         utf8.extend_from_slice("보고서".as_bytes());
         assert_eq!(decode_pdf_text_string(&utf8), "보고서");
         assert_eq!(decode_pdf_text_string(b"Jane Doe"), "Jane Doe");
+    }
+
+    #[test]
+    fn csv_raw_numeric_table_is_summarized_while_preserving_headers_and_categories() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("telemetry.csv");
+        let mut content = String::from("Timestamp,Rack_ID,Cell_V,Temp_C,Current_A\n");
+        for i in 0..300 {
+            let rack = if i == 180 { "RACK_FAULT_07" } else { "RACK_NORMAL_01" };
+            content.push_str(&format!("2026-11-19,{rack},3.7124,25.4,12.{i:03}\n"));
+        }
+        fs::write(&csv, content).unwrap();
+
+        let text = extract_text(&csv).expect("CSV should extract summary");
+        assert!(text.contains("데이터 파일 요약"), "Summary header missing: {text}");
+        assert!(text.contains("Cell_V"), "Column header must remain searchable");
+        assert!(text.contains("RACK_FAULT_07"), "Unique string category at row 180 must remain searchable");
+        assert!(!text.contains("12.299"), "Trailing bulk numeric rows must not bloat index");
+    }
+
+    #[test]
+    fn html_strips_scripts_styles_and_extracts_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let html = dir.path().join("confluence_page.html");
+        fs::write(
+            &html,
+            r#"<!DOCTYPE html><html><head><title>배터리 시뮬레이터 설계안 &amp; 검증</title>
+            <style>.hidden-css-token { color: red; }</style>
+            <script>const secretJsNoise = 99999;</script></head>
+            <body><h1>아키텍처 결정</h1><p>실행 캐시를 도입한다.</p></body></html>"#,
+        )
+        .unwrap();
+
+        let doc = extract_document_with(&html, &IndexRules::default()).unwrap();
+        assert_eq!(
+            doc.props.title.as_deref(),
+            Some("배터리 시뮬레이터 설계안 & 검증")
+        );
+        assert!(doc.text.contains("아키텍처 결정"));
+        assert!(doc.text.contains("실행 캐시를 도입한다."));
+        assert!(!doc.text.contains("hidden-css-token"));
+        assert!(!doc.text.contains("secretJsNoise"));
     }
 }

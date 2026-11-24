@@ -6,7 +6,7 @@
 use std::path::Path;
 
 /// 支持 OCR 的图片扩展名（不含点，小写）。见设计文档第三节"索引侧变化"。
-const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp"];
+pub(crate) const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp"];
 
 /// 单张图片体积上限，沿用文本抽取的 20MB 预算（extract.rs::MAX_FILE_BYTES 同值，
 /// 两边独立定义是因为图片和文本走的是两条完全不同的管线，没必要为了共享一个常量
@@ -19,7 +19,8 @@ pub(crate) fn is_image(path: &Path) -> bool {
     let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
         return false;
     };
-    IMAGE_EXTS.contains(&ext.to_ascii_lowercase().as_str())
+    let ext = ext.to_ascii_lowercase();
+    IMAGE_EXTS.contains(&ext.as_str()) && crate::rules::active_rules().allows_extension(&ext)
 }
 
 /// 一个字符是否算 CJK 表意文字。只覆盖常用汉字区、扩展 A 区、兼容表意文字区——

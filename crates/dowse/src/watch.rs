@@ -209,11 +209,23 @@ pub fn run_watch(
     roots: &[PathBuf],
     updater: Arc<Mutex<IndexUpdater>>,
     stop: Arc<AtomicBool>,
+    on_progress: impl FnMut(WatchProgress),
+) -> Result<()> {
+    run_watch_inner(source, roots, updater, stop, on_progress, || {})
+}
+
+fn run_watch_inner(
+    source: impl EventSource,
+    roots: &[PathBuf],
+    updater: Arc<Mutex<IndexUpdater>>,
+    stop: Arc<AtomicBool>,
     mut on_progress: impl FnMut(WatchProgress),
+    on_subscribed: impl FnOnce(),
 ) -> Result<()> {
     let (tx, rx) = std::sync::mpsc::channel::<WatchEvent>();
     // guard 留到函数结束：drop 掉它 notify 才停。
     let _guard = source.watch(roots, tx)?;
+    on_subscribed();
 
     let mut debouncer = Debouncer::new(roots.to_vec());
     let window = Duration::from_millis(QUIET_WINDOW_MS);
@@ -269,6 +281,23 @@ fn flush_batch(
             on_progress(WatchProgress::CommitFailed(err.to_string()));
         }
     }
+}
+
+fn reconcile_and_watch(
+    roots: &[PathBuf],
+    updater: Arc<Mutex<IndexUpdater>>,
+    stop: Arc<AtomicBool>,
+    on_progress: impl FnMut(WatchProgress),
+) -> Result<()> {
+    // Subscribe before scanning, so edits during the scan are queued for incremental updates.
+    run_watch_inner(NotifyEventSource, roots, updater.clone(), stop, on_progress, || {
+        for root in roots {
+            let mut guard = updater.lock().unwrap_or_else(|e| e.into_inner());
+            if let Err(err) = crate::reconcile::reconcile(root, &mut guard) {
+                eprintln!("启动对账 {} 失败: {err}", root.display());
+            }
+        }
+    })
 }
 
 /// 按卷判定自动选监听路径的入口（里程碑 6）：每个根探测 NTFS + 管理员权限，
@@ -359,15 +388,7 @@ pub fn watch_roots_auto(
     let volume_starts: Option<()> = None;
 
     if fast_roots.is_empty() || volume_starts.is_none() {
-        for root in &slow_roots {
-            let mut guard = updater.lock().unwrap_or_else(|e| e.into_inner());
-            if let Err(err) = crate::reconcile::reconcile(root, &mut guard) {
-                eprintln!("启动对账 {} 失败: {err}", root.display());
-            }
-        }
-        return run_watch(NotifyEventSource, &slow_roots, updater, stop, move |p| {
-            on_progress(p)
-        });
+        return reconcile_and_watch(&slow_roots, updater, stop, on_progress);
     }
 
     // 非 Windows 平台上 volume_starts 恒为 None（见上面的 #[cfg(not(windows))]
@@ -388,18 +409,9 @@ pub fn watch_roots_auto(
             let stop = stop.clone();
             let on_progress = on_progress.clone();
             Some(std::thread::spawn(move || {
-                for root in &slow_roots {
-                    let mut guard = updater.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Err(err) = crate::reconcile::reconcile(root, &mut guard) {
-                        eprintln!("启动对账 {} 失败: {err}", root.display());
-                    }
-                }
-                let on_progress = on_progress.clone();
-                if let Err(err) =
-                    run_watch(NotifyEventSource, &slow_roots, updater, stop, move |p| {
-                        on_progress(p)
-                    })
-                {
+                if let Err(err) = reconcile_and_watch(&slow_roots, updater, stop, move |p| {
+                    on_progress(p)
+                }) {
                     eprintln!("慢车道监听退出: {err}");
                 }
             }))
@@ -435,16 +447,7 @@ pub fn watch_roots_auto(
                 // 这些根本来会完全没人监听。下次启动时仍然会重新探测，重新
                 // 尝试快车道，这里只影响"这一次运行"。
                 eprintln!("快车道启动失败，本次运行把这些根并入慢车道继续: {err}");
-                for root in &fast_roots_for_fallback {
-                    let mut guard = updater_for_fallback
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    if let Err(err) = crate::reconcile::reconcile(root, &mut guard) {
-                        eprintln!("启动对账 {} 失败: {err}", root.display());
-                    }
-                }
-                run_watch(
-                    NotifyEventSource,
+                reconcile_and_watch(
                     &fast_roots_for_fallback,
                     updater_for_fallback,
                     stop_for_fallback,

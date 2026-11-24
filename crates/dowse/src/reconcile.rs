@@ -126,10 +126,11 @@ pub fn reconcile_orphans(roots: &[PathBuf], updater: &mut IndexUpdater) -> Resul
         let Some(path) = doc.get_first(fields.path).and_then(|v| v.as_str()) else {
             continue;
         };
-        let pbuf = PathBuf::from(path);
+        let base_path = path.split_once("::").map_or(path, |(base, _)| base);
+        let pbuf = PathBuf::from(base_path);
         if !roots.iter().any(|r| pbuf.starts_with(r)) {
             batch.push(PendingChange {
-                path: pbuf,
+                path: PathBuf::from(path),
                 op: PendingOp::Remove,
             });
         }
@@ -160,6 +161,10 @@ fn snapshot_indexed(updater: &IndexUpdater, root: &Path) -> Result<HashMap<PathB
         let Some(path) = doc.get_first(fields.path).and_then(|v| v.as_str()) else {
             continue;
         };
+        // PST/OST 내부 가상 메일 문서(`file.pst::nid`)는 상위 컨테이너(`file.pst`)의 mtime/size로 통합 대조한다.
+        if path.contains("::") {
+            continue;
+        }
         let pbuf = PathBuf::from(path);
         // 只对账这个根下的文档，多个根各扫各的，互不干扰。
         if !pbuf.starts_with(root) {

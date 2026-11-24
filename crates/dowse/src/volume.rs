@@ -73,6 +73,14 @@ static CAPABILITY_CACHE: LazyLock<Mutex<HashMap<VolumeKey, RootCapability>>> =
 /// `tests/ntfs_fast_path.rs` 是唯一的例外：它就是专门验证真快车道（MFT 枚举 +
 /// USN Journal）本身的测试，绝不能设这个变量，否则会在管理员环境下也静默
 /// 退化成只测降级路径，白白丢失覆盖。
+static DIRECTORY_SCANS_ONLY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Use ordinary directory listing and filesystem notifications for this process.
+pub fn use_directory_scans() {
+    DIRECTORY_SCANS_ONLY.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 const FORCE_SLOW_LANE_ENV: &str = "DOWSE_FORCE_SLOW_LANE";
 
 /// 探测一个监听根应该走快车道还是慢车道。诚实降级：拿不到卷句柄（非管理员）
@@ -88,6 +96,11 @@ pub(crate) fn probe_root_capability(root: &Path) -> RootCapability {
     // 二进制（`cargo test -p dowse --lib`）时为真；`tests/*.rs` 下的集成
     // 测试（含 `ntfs_fast_path.rs`）是把 `dowse` 当普通依赖库链接，编译时
     // 不带 `--cfg test`，不受这条短路影响，快车道覆盖不受损。
+    if DIRECTORY_SCANS_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
+        return RootCapability::Fallback {
+            reason: "Directory scans configured".into(),
+        };
+    }
     if cfg!(test) || std::env::var_os(FORCE_SLOW_LANE_ENV).is_some() {
         return RootCapability::Fallback {
             reason: "测试环境（cfg(test) 或 DOWSE_FORCE_SLOW_LANE 逃生舱），强制走慢车道"

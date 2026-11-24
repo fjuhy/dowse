@@ -114,13 +114,12 @@ pub(crate) fn walk_index_files_with(
     WalkDir::new(root)
         .into_iter()
         .filter_entry(move |e| {
-            // 根目录是显式指定的扫描起点，跳过规则不适用于它——否则 filter_entry
-            // 会让 walkdir 连根都不下钻，整棵树静默扫出 0 个文件。
             if e.depth() == 0 {
-                return true;
+                return !rules.explicit_exclusion(e.path());
             }
             let name = e.file_name().to_string_lossy();
-            !(e.file_type().is_dir() && rules.is_dir_excluded(&name))
+            !(e.file_type().is_dir()
+                && (rules.is_dir_excluded(&name) || rules.explicit_exclusion(e.path())))
         })
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
@@ -230,6 +229,81 @@ pub(crate) fn add_file_document(
         } else {
             AddOutcome::Skipped
         });
+    }
+
+    if crate::pst::is_pst_container(path) {
+        let ext = path
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        if !crate::rules::active_rules().allows_extension(&ext) {
+            return Ok(AddOutcome::Skipped);
+        }
+        let Some(archive) = crate::pst::extract_pst_archive(path) else {
+            return Ok(AddOutcome::Skipped);
+        };
+        let (mtime, size) = file_stat(path).unwrap_or((0, 0));
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let path_str = path.to_string_lossy().into_owned();
+
+        // 1. Container summary document at exact `path_str` (used by reconcile & Markdown export)
+        let summary = archive.summary_text;
+        let container_doc = doc!(
+            fields.path => path_str.clone(),
+            fields.name => file_name.clone(),
+            fields.ext => ext.clone(),
+            fields.content => summary.clone(),
+            fields.mtime => mtime,
+            fields.size => size,
+            fields.kind => "text",
+            fields.path_text => path_str.clone(),
+            fields.name_chars => file_name.clone(),
+            fields.content_chars => summary.clone(),
+            fields.name_prefixes => file_name.clone(),
+            fields.content_prefixes => summary,
+        );
+        writer.add_document(container_doc)?;
+
+        // 2. Individual email documents (`path_str::nid`) for granular subject/sender/date/body search
+        for mail in archive.emails {
+            let vpath = format!("{path_str}::{}", mail.nid);
+            let mail_name = format!("[메일] {} ({file_name})", mail.subject);
+            let path_tokens = if mail.folder_path.is_empty() {
+                path_str.clone()
+            } else {
+                format!("{path_str}\\{}", mail.folder_path)
+            };
+            let mail_mtime = mail.timestamp_ms.unwrap_or(mtime);
+            let mail_size = mail.content.len() as u64;
+            let body = mail.content;
+
+            let mut mail_doc = doc!(
+                fields.path => vpath,
+                fields.name => mail_name.clone(),
+                fields.ext => ext.clone(),
+                fields.content => body.clone(),
+                fields.mtime => mail_mtime,
+                fields.size => mail_size,
+                fields.kind => "text",
+                fields.path_text => path_tokens,
+                fields.name_chars => mail_name.clone(),
+                fields.content_chars => body.clone(),
+                fields.name_prefixes => mail_name,
+                fields.content_prefixes => body,
+            );
+            let props = crate::extract::DocProps {
+                title: Some(mail.subject),
+                author: mail.sender,
+                created: mail.created_ms,
+                modified: mail.modified_ms,
+            };
+            add_doc_props(&mut mail_doc, fields, &props);
+            writer.add_document(mail_doc)?;
+        }
+        return Ok(AddOutcome::Indexed);
     }
 
     let Some(extracted) = extract_document(path) else {
@@ -521,6 +595,110 @@ pub fn rebuild_index_with_progress(
     unreachable!("循环要么在 Ok 分支返回，要么在最后一次尝试的 Err 分支返回")
 }
 
+/// 멀티코어 병렬 파일 처리: 파일 수가 많을 때 워커 스레드 풀에서 문서 압축 해제·파싱·색인 추가를
+/// 병렬 수행하고, 호출 스레드에서 진행률 콜백(`on_progress`)과 집계를 순서대로 처리한다.
+pub(crate) fn process_files_parallel<F>(
+    files: &[PathBuf],
+    op: F,
+    on_progress: &mut impl FnMut(IndexProgress),
+) -> Result<(usize, usize, usize)>
+where
+    F: Fn(&Path) -> Result<AddOutcome> + Sync,
+{
+    let mut indexed = 0usize;
+    let mut skipped = 0usize;
+    let mut skipped_oversize = 0usize;
+
+    if files.len() < 8 {
+        for (i, path) in files.iter().enumerate() {
+            match op(path)? {
+                AddOutcome::Indexed => indexed += 1,
+                AddOutcome::Skipped => skipped += 1,
+                AddOutcome::SkippedOversize => {
+                    skipped += 1;
+                    skipped_oversize += 1;
+                }
+            }
+            let processed = i + 1;
+            if processed % PROGRESS_INTERVAL == 0 {
+                on_progress(IndexProgress {
+                    processed,
+                    path: path.clone(),
+                });
+            }
+        }
+        return Ok((indexed, skipped, skipped_oversize));
+    }
+
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(2, 12)
+        .min(files.len());
+    let next_idx = std::sync::atomic::AtomicUsize::new(0);
+    let abort = std::sync::atomic::AtomicBool::new(false);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(PathBuf, Result<AddOutcome>)>(workers * 4);
+
+    let op_ref = &op;
+    let next_ref = &next_idx;
+    let abort_ref = &abort;
+
+    let mut first_err: Option<anyhow::Error> = None;
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            let tx_worker = tx.clone();
+            s.spawn(move || {
+                loop {
+                    if abort_ref.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    let idx = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if idx >= files.len() {
+                        break;
+                    }
+                    let path = &files[idx];
+                    let res = op_ref(path);
+                    if res.is_err() {
+                        abort_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    if tx_worker.send((path.clone(), res)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(tx);
+
+        let mut processed = 0usize;
+        for (path, res) in rx {
+            match res {
+                Ok(AddOutcome::Indexed) => indexed += 1,
+                Ok(AddOutcome::Skipped) => skipped += 1,
+                Ok(AddOutcome::SkippedOversize) => {
+                    skipped += 1;
+                    skipped_oversize += 1;
+                }
+                Err(err) => {
+                    abort_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                    if first_err.is_none() {
+                        first_err = Some(err);
+                    }
+                    continue;
+                }
+            }
+            processed += 1;
+            if processed % PROGRESS_INTERVAL == 0 {
+                on_progress(IndexProgress { processed, path });
+            }
+        }
+    });
+
+    if let Some(err) = first_err {
+        return Err(err);
+    }
+    Ok((indexed, skipped, skipped_oversize))
+}
+
 /// 一次重建尝试：删旧目录、建新索引、把 `files` 全部写进去，返回收录/跳过计数
 /// 和 USN 游标基线，交给 `finish_rebuild` 收尾。失败时上层决定要不要整次重试。
 fn rebuild_index_attempt(
@@ -551,33 +729,12 @@ fn rebuild_index_attempt(
     let mut writer: IndexWriter =
         index.writer_with_num_threads(writer_threads, 200 * 1024 * 1024)?;
 
-    let mut indexed = 0usize;
-    let mut skipped = 0usize;
-    let mut skipped_oversize = 0usize;
-
-    // 按卷判定走 MFT 快速枚举还是现有的 walkdir 遍历（设计文档第一节）。
-    // 两条路径产出的文件清单语义一致——下面的收录循环完全不用关心是哪条路径
-    // 来的，这正是"上层感知不到差别"要的效果。
     let (files, usn_cursors) = collect_index_files(target_dir);
-
-    for path in files {
-        match add_file_document(&writer, &fields, &path, index_dir)? {
-            AddOutcome::Indexed => indexed += 1,
-            // 超限跳过既计入总跳过数，也单独累加一份明细。
-            AddOutcome::Skipped => skipped += 1,
-            AddOutcome::SkippedOversize => {
-                skipped += 1;
-                skipped_oversize += 1;
-            }
-        }
-        let processed = indexed + skipped;
-        if processed % PROGRESS_INTERVAL == 0 {
-            on_progress(IndexProgress {
-                processed,
-                path: path.clone(),
-            });
-        }
-    }
+    let (indexed, skipped, skipped_oversize) = process_files_parallel(
+        &files,
+        |path| add_file_document(&writer, &fields, path, index_dir),
+        on_progress,
+    )?;
 
     let ocr_queue = OcrQueue::for_index_dir(index_dir);
 
@@ -782,6 +939,7 @@ mod tests {
         let rules = std::sync::Arc::new(crate::rules::IndexRules {
             exclude_dirs: vec!["build".into()],
             extra_text_exts: vec![],
+            enabled_extensions: None,
             max_file_mb: 20,
         });
         let mut files: Vec<String> = walk_index_files_with(root.path(), rules)

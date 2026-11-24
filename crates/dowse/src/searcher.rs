@@ -10,15 +10,15 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use tantivy::collector::{Count, TopDocs};
 use tantivy::query::{
-    AllQuery, BooleanQuery, BoostQuery, Occur, PhraseQuery, Query, QueryParser, RangeQuery,
-    RegexQuery, TermQuery,
+    AllQuery, BooleanQuery, BoostQuery, ConstScoreQuery, Occur, PhraseQuery, Query, QueryParser,
+    RangeQuery, RegexQuery, TermQuery,
 };
 use tantivy::schema::{Field, IndexRecordOption, Value};
 use tantivy::snippet::SnippetGenerator;
 use tantivy::tokenizer::{TokenStream, Tokenizer};
 use tantivy::{DocAddress, Index, IndexReader, Order, TantivyDocument, Term};
 
-use crate::query::{self, Cmp};
+use crate::query::{self, Cmp, Expr, TextField};
 use crate::{Fields, build_schema, register_tokenizers};
 
 /// 输入即搜的普通查询只接受不会触发 tantivy 查询语法的字符。引号、字段冒号、
@@ -433,27 +433,13 @@ impl Searcher {
         let typeahead_prefix = typeahead_prefix_token(query_str);
         let (retrieval_query, snippet_query) = self.build_queries(query_str)?;
         let query: Box<dyn Query> = match ext_group {
-            Some(exts) if !exts.is_empty() => {
-                let ext_should: Vec<(Occur, Box<dyn Query>)> = exts
-                    .iter()
-                    .map(|ext| {
-                        let term =
-                            Term::from_field_text(self.fields.ext, &ext.to_ascii_lowercase());
-                        (
-                            Occur::Should,
-                            Box::new(TermQuery::new(term, IndexRecordOption::Basic))
-                                as Box<dyn Query>,
-                        )
-                    })
-                    .collect();
-                Box::new(BooleanQuery::new(vec![
-                    (Occur::Must, retrieval_query),
-                    (
-                        Occur::Must,
-                        Box::new(BooleanQuery::new(ext_should)) as Box<dyn Query>,
-                    ),
-                ]))
-            }
+            Some(exts) if !exts.is_empty() => Box::new(BooleanQuery::new(vec![
+                (Occur::Must, retrieval_query),
+                (
+                    Occur::Must,
+                    self.build_extension_query(exts.iter().map(|ext| ext.to_ascii_lowercase())),
+                ),
+            ])),
             _ => retrieval_query,
         };
         let searcher = self.reader.searcher();
@@ -548,10 +534,16 @@ impl Searcher {
                 .to_owned();
 
             let (snippet, highlighted) = match typeahead_prefix.as_deref() {
-                Some(prefix) => {
-                    snippet_for_typeahead_prefix(&snippet_gen, content, prefix, SNIPPET_MAX_CHARS)
+                Some(prefix) => snippet_for_typeahead_prefix(
+                    &snippet_gen,
+                    content,
+                    query_str,
+                    prefix,
+                    SNIPPET_MAX_CHARS,
+                ),
+                None => {
+                    snippet_with_fallback(&snippet_gen, content, Some(query_str), SNIPPET_MAX_CHARS)
                 }
-                None => snippet_with_fallback(&snippet_gen, content, SNIPPET_MAX_CHARS),
             };
             let text_prop = |field| {
                 doc.get_first(field)
@@ -581,18 +573,17 @@ impl Searcher {
     /// QueryParser 语法仍交回原解析器；`path:` / `mtime:` / `size:` / `OR` / `NOT`
     /// 等结构化操作符走下面的显式拼装。
     fn build_queries(&self, query_str: &str) -> Result<(Box<dyn Query>, Box<dyn Query>)> {
-        let parsed = query::parse(query_str)?;
-        if !parsed.has_operators {
-            if let Some(parts) = plain_typeahead_parts(query_str) {
-                let prefix_last = !query_str.chars().last().is_some_and(char::is_whitespace);
-                return self.build_typeahead_queries(query_str, &parts, prefix_last);
-            }
-            return Ok((
-                self.parser.parse_query(query_str)?,
-                self.parser.parse_query(query_str)?,
-            ));
+        if let Some(expr) = query::parse(query_str)? {
+            let mut highlights = Vec::new();
+            let retrieval = self.compile_expr(&expr, &mut highlights, true)?;
+            return Ok((retrieval, Box::new(BooleanQuery::new(highlights))));
         }
-        self.build_from_parsed(&parsed)
+        if let Some(parts) = plain_typeahead_parts(query_str) {
+            let prefix_last = !query_str.chars().last().is_some_and(char::is_whitespace);
+            return self.build_typeahead_queries(query_str, &parts, prefix_last);
+        }
+        let query = self.parser.parse_query(query_str)?;
+        Ok((query.box_clone(), query))
     }
 
     /// 普通输入走独立 autocomplete 召回通道：每个 CJK 连续段是逐字短语，普通词的
@@ -655,94 +646,87 @@ impl Searcher {
         ))
     }
 
-    /// 把结构化的 [`query::Parsed`] 拼成（检索查询, 纯内容高亮查询）。
-    ///
-    /// 组内各条件 AND（`Occur::Must`，排除词走 `Occur::MustNot`），组间 OR
-    /// （`Occur::Should`），落实"AND 优先级高于 OR"。纯内容查询把所有组的正内容词
-    /// 以 `Should` 并起来喂给 SnippetGenerator——高亮只关心"哪些词出现在原文里"，
-    /// 不需要复刻 AND/OR 的结构。
-    fn build_from_parsed(
+    fn compile_expr(
         &self,
-        parsed: &query::Parsed,
-    ) -> Result<(Box<dyn Query>, Box<dyn Query>)> {
-        let mut group_queries: Vec<Box<dyn Query>> = Vec::new();
-        // 所有组的正内容词并集，只给高亮用。
-        let mut content_only: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-
-        for group in &parsed.groups {
-            let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-
-            for term in &group.content {
-                // 内容词原样交给主 QueryParser（同时查 name+content，短语/子词都由它处理）。
-                clauses.push((Occur::Must, self.parser.parse_query(term)?));
-                // 再解析一份进高亮集合——Box<dyn Query> 不能克隆，只能重解析一次。
-                content_only.push((Occur::Should, self.parser.parse_query(term)?));
+        expr: &Expr<'_>,
+        highlights: &mut Vec<(Occur, Box<dyn Query>)>,
+        highlight: bool,
+    ) -> Result<Box<dyn Query>> {
+        match expr {
+            Expr::Term(term) => {
+                let query = self.parser.parse_query(term)?;
+                if highlight {
+                    highlights.push((Occur::Should, query.box_clone()));
+                }
+                Ok(query)
             }
-            for term in &group.excluded {
-                clauses.push((Occur::MustNot, self.parser.parse_query(term)?));
+            Expr::Text(field, term) => {
+                let (field, label) = match field {
+                    TextField::Name => (self.fields.name, "name"),
+                    TextField::Body => (self.fields.content, "body"),
+                    TextField::Path => (self.fields.path_text, "path"),
+                    TextField::Author => (self.fields.author, "author"),
+                    TextField::Title => (self.fields.title, "title"),
+                };
+                let query = self.build_field_term_query(field, label, term)?;
+                if highlight && field == self.fields.content {
+                    highlights.push((Occur::Should, query.box_clone()));
+                }
+                Ok(query)
             }
-            for path in &group.paths {
-                clauses.push((Occur::Must, self.build_path_query(path)?));
+            Expr::Ext(exts) => Ok(self.build_extension_query(exts.iter())),
+            Expr::Mtime(bound) => Ok(self.build_mtime_query(bound)),
+            Expr::Size(bound) => Ok(self.build_size_query(bound)),
+            Expr::Not(inner) => Ok(Box::new(BooleanQuery::new(vec![
+                (Occur::Must, Box::new(ConstScoreQuery::new(Box::new(AllQuery), 0.0))),
+                (Occur::MustNot, self.compile_expr(inner, highlights, false)?),
+            ]))),
+            Expr::And(terms) => {
+                let mut clauses = Vec::with_capacity(terms.len());
+                let mut has_positive = false;
+                for term in terms {
+                    if let Expr::Not(inner) = term {
+                        clauses.push((Occur::MustNot, self.compile_expr(inner, highlights, false)?));
+                    } else {
+                        has_positive = true;
+                        clauses.push((Occur::Must, self.compile_expr(term, highlights, highlight)?));
+                    }
+                }
+                if !has_positive {
+                    clauses.push((Occur::Must, Box::new(ConstScoreQuery::new(Box::new(AllQuery), 0.0))));
+                }
+                Ok(Box::new(BooleanQuery::new(clauses)))
             }
-            for author in &group.authors {
-                clauses.push((
-                    Occur::Must,
-                    self.build_field_term_query(self.fields.author, "author", author)?,
-                ));
+            Expr::Or(terms) => {
+                let mut clauses = Vec::with_capacity(terms.len());
+                for term in terms {
+                    clauses.push((Occur::Should, self.compile_expr(term, highlights, highlight)?));
+                }
+                Ok(Box::new(BooleanQuery::new(clauses)))
             }
-            for title in &group.titles {
-                clauses.push((
-                    Occur::Must,
-                    self.build_field_term_query(self.fields.title, "title", title)?,
-                ));
-            }
-            for bound in &group.mtimes {
-                clauses.push((Occur::Must, self.build_mtime_query(bound)));
-            }
-            for bound in &group.sizes {
-                clauses.push((Occur::Must, self.build_size_query(bound)));
-            }
-
-            // 只有排除条件、没有任何正向条件的组（如 `-草稿` 单独成组）：tantivy 的
-            // BooleanQuery 只有 MustNot 会匹配空集，补一个 AllQuery 当正向底座，
-            // 语义才是"全部里排掉这些"。
-            let has_positive = clauses.iter().any(|(occ, _)| *occ != Occur::MustNot);
-            if !has_positive {
-                clauses.push((Occur::Must, Box::new(AllQuery)));
-            }
-            group_queries.push(Box::new(BooleanQuery::new(clauses)));
         }
+    }
 
-        let retrieval: Box<dyn Query> = if group_queries.len() == 1 {
-            // 单组不套 OR 外壳，省一层 BooleanQuery。
-            group_queries.pop().expect("已判定非空")
+    fn build_extension_query(
+        &self,
+        exts: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> Box<dyn Query> {
+        let mut queries = exts.into_iter().map(|ext| {
+            let term = Term::from_field_text(self.fields.ext, ext.as_ref());
+            Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>
+        });
+        let first = queries.next().expect("non-empty extension list");
+        let query = if let Some(second) = queries.next() {
+            Box::new(BooleanQuery::new(
+                [first, second].into_iter().chain(queries).map(|q| (Occur::Should, q)).collect(),
+            )) as Box<dyn Query>
         } else {
-            let shoulds = group_queries
-                .into_iter()
-                .map(|q| (Occur::Should, q))
-                .collect();
-            Box::new(BooleanQuery::new(shoulds))
+            first
         };
-
-        // 纯内容查询可能为空（整串只有操作符、没有内容词）：空 BooleanQuery 不匹配任何
-        // term，SnippetGenerator 拿不到高亮词，摘要走"文档开头无高亮"兜底，符合预期。
-        let snippet: Box<dyn Query> = Box::new(BooleanQuery::new(content_only));
-        Ok((retrieval, snippet))
+        Box::new(ConstScoreQuery::new(query, 0.0))
     }
 
-    /// 把一条 `path:` 操作数拼成 path_text 字段上的查询。
-    ///
-    /// 用跟索引侧同一个 [`crate::tokenizer::MixedTokenizer`] 把操作数切成 token，
-    /// 保证"查"和"建"两侧口径一致（否则大小写/子词边界对不上就搜不到）。带引号的
-    /// 操作数（`path:"my docs"`）且切出多个 token 时按短语（相邻位置）匹配，落实
-    /// "按整体处理"；否则多个 token 之间 AND、单 token 直接一个 TermQuery。
-    fn build_path_query(&self, path: &query::PathTerm) -> Result<Box<dyn Query>> {
-        self.build_field_term_query(self.fields.path_text, "path", path)
-    }
-
-    /// `path:` / `author:` / `title:` 공용: 색인과 같은 MixedTokenizer로 피연산자를
-    /// 토큰화해 `field` 위의 쿼리를 만든다. 따옴표 + 여러 토큰이면 PhraseQuery,
-    /// 아니면 토큰 AND. author/title 필드도 "jieba"(MixedTokenizer) + 위치 색인이다.
+    /// Use the indexed tokenizer for scoped terms; quotes require adjacent tokens.
     fn build_field_term_query(
         &self,
         field: tantivy::schema::Field,
@@ -757,7 +741,7 @@ impl Searcher {
         }
         if terms.is_empty() {
             bail!(
-                "{label}: 操作数 \"{}\" 里没有可检索的内容（全是标点/空白？）",
+                "{label}: 검색 조건 \"{}\"에 검색할 글자나 숫자가 없습니다.",
                 path.operand
             );
         }
@@ -766,14 +750,14 @@ impl Searcher {
         }
         if terms.len() == 1 {
             let term = terms.pop().expect("刚判过长度为 1");
-            return Ok(Box::new(TermQuery::new(term, IndexRecordOption::Basic)));
+            return Ok(Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)));
         }
         let clauses: Vec<(Occur, Box<dyn Query>)> = terms
             .into_iter()
             .map(|t| {
                 (
                     Occur::Must,
-                    Box::new(TermQuery::new(t, IndexRecordOption::Basic)) as Box<dyn Query>,
+                    Box::new(TermQuery::new(t, IndexRecordOption::WithFreqs)) as Box<dyn Query>,
                 )
             })
             .collect();
@@ -954,10 +938,14 @@ impl Searcher {
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
             let (snippet, highlighted) = match typeahead_prefix.as_deref() {
-                Some(prefix) => {
-                    snippet_for_typeahead_prefix(&snippet_gen, content, prefix, PREVIEW_MAX_CHARS)
-                }
-                None => snippet_with_fallback(&snippet_gen, content, PREVIEW_MAX_CHARS),
+                Some(prefix) => snippet_for_typeahead_prefix(
+                    &snippet_gen,
+                    content,
+                    query_str,
+                    prefix,
+                    PREVIEW_MAX_CHARS,
+                ),
+                None => snippet_with_fallback(&snippet_gen, content, None, PREVIEW_MAX_CHARS),
             };
             let (size, mtime, ext) = self.doc_meta(&doc);
             return Ok(Some(PreviewHit {
@@ -1049,6 +1037,22 @@ fn truncate_scan_window(content: &str) -> &str {
     &content[..end]
 }
 
+fn first_literal_prefix_range(text: &str, prefix: &str) -> Option<Range<usize>> {
+    if prefix.is_empty() || prefix.len() > text.len() {
+        return None;
+    }
+    if !prefix.is_ascii() {
+        return text.find(prefix).map(|s| s..(s + prefix.len()));
+    }
+    text.char_indices().find_map(|(start, _)| {
+        let end = start + prefix.len();
+        (end <= text.len()
+            && text.is_char_boundary(end)
+            && text[start..end].eq_ignore_ascii_case(prefix))
+        .then_some(start..end)
+    })
+}
+
 /// 在 UTF-8 字符边界上查找用户仍在输入的最后一段。中文按原字面匹配，ASCII
 /// 忽略大小写；返回的仍是原文 byte range，可直接交给前端切片。
 fn literal_prefix_ranges(text: &str, prefix: &str) -> Vec<Range<usize>> {
@@ -1067,22 +1071,61 @@ fn literal_prefix_ranges(text: &str, prefix: &str) -> Vec<Range<usize>> {
         .collect()
 }
 
-/// autocomplete 辅助字段不属于正文原字段，SnippetGenerator 不会据此计算高亮。
-/// 若扫描窗口里有字面前缀，主动
-/// 取它周围的窗口并只高亮用户已经输入的部分；命中只在文件名或超长正文后段时，
-/// 仍复用原来的安全兜底，保持截断边界不变。
+/// Narrow a large `scan_window` (up to 128 KB) to a compact ~6 KB UTF-8 slice around
+/// the first query-term occurrence so `SnippetGenerator` never re-tokenizes 128 KB
+/// per row on list results (`lindera`/`jieba` over 100×128 KB = 12.8 MB per keystroke).
+fn narrow_list_scan_slice<'a>(scan_window: &'a str, query_str: &str) -> &'a str {
+    const LIST_WINDOW_BYTES: usize = 6 * 1024;
+    if scan_window.len() <= LIST_WINDOW_BYTES {
+        return scan_window;
+    }
+
+    let mut hit_pos: Option<usize> = None;
+    for raw_tok in query_str.split(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '(' || c == ')') {
+        let tok = raw_tok.trim();
+        if tok.is_empty()
+            || tok == "OR"
+            || tok == "NOT"
+            || tok.starts_with('-')
+            || tok.starts_with("path:")
+            || tok.starts_with("mtime:")
+            || tok.starts_with("size:")
+            || tok.starts_with("author:")
+            || tok.starts_with("title:")
+        {
+            continue;
+        }
+        if let Some(r) = first_literal_prefix_range(scan_window, tok) {
+            hit_pos = Some(hit_pos.map_or(r.start, |cur| cur.min(r.start)));
+            if hit_pos == Some(0) {
+                break;
+            }
+        }
+    }
+
+    let center = hit_pos.unwrap_or(0);
+    let mut start = center.saturating_sub(LIST_WINDOW_BYTES / 3);
+    while start > 0 && !scan_window.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = (start + LIST_WINDOW_BYTES).min(scan_window.len());
+    while end > start && !scan_window.is_char_boundary(end) {
+        end -= 1;
+    }
+    &scan_window[start..end]
+}
+
 fn snippet_for_typeahead_prefix(
     snippet_gen: &SnippetGenerator,
     content: &str,
+    query_str: &str,
     prefix: &str,
     max_chars: usize,
 ) -> (String, Vec<Range<usize>>) {
     let scan_window = truncate_scan_window(content);
-    let Some(first) = literal_prefix_ranges(scan_window, prefix)
-        .into_iter()
-        .next()
-    else {
-        return snippet_with_fallback(snippet_gen, content, max_chars);
+    let Some(first) = first_literal_prefix_range(scan_window, prefix) else {
+        let hint = (max_chars <= SNIPPET_MAX_CHARS).then_some(query_str);
+        return snippet_with_fallback(snippet_gen, content, hint, max_chars);
     };
 
     let hit_char = scan_window[..first.start].chars().count();
@@ -1096,17 +1139,18 @@ fn snippet_for_typeahead_prefix(
     (fragment, highlighted)
 }
 
-/// 在截断后的扫描窗口内生成摘要；如果窗口内一个命中区间都没有（比如命中词
-/// 只出现在文档中后段、被截断切掉了），退回“文档开头一段、无高亮”的摘录，
-/// 跟 `preview()` 里查询词和文档完全不匹配时的回退写法保持一致——
-/// 都是“有文件但没有预览片段”的可接受降级，而不是给用户一个空字符串。
 fn snippet_with_fallback(
     snippet_gen: &SnippetGenerator,
     content: &str,
+    list_query_hint: Option<&str>,
     fallback_chars: usize,
 ) -> (String, Vec<Range<usize>>) {
     let scan_window = truncate_scan_window(content);
-    let snippet = snippet_gen.snippet(scan_window);
+    let target_window = match list_query_hint {
+        Some(q) => narrow_list_scan_slice(scan_window, q),
+        None => scan_window,
+    };
+    let snippet = snippet_gen.snippet(target_window);
     if !snippet.highlighted().is_empty() {
         return (
             snippet.fragment().to_owned(),
@@ -1928,6 +1972,50 @@ mod tests {
     }
 
     #[test]
+    fn search_scoped_boolean_expression_filters_and_highlights() -> Result<()> {
+        let index = tempfile::tempdir()?;
+        let files = tempfile::tempdir()?;
+        for (name, body) in [
+            ("design-notes.md", "battery fire safety"),
+            ("archive.txt", "design notes battery safety"),
+            ("design-notes.txt", "battery fire safety draft"),
+            ("battery.md", "unrelated"),
+        ] {
+            std::fs::write(files.path().join(name), body)?;
+        }
+        crate::rebuild_index(index.path(), files.path())?;
+        let searcher = Searcher::open(index.path())?;
+        let cases: &[(&str, &[&str])] = &[
+            (r#"name:"design notes" AND ext:.MD"#, &["design-notes.md"]),
+            (r#"body:"design notes" ext:md,TXT"#, &["archive.txt"]),
+            (r#"body:"battery safety""#, &["archive.txt"]),
+            ("body:unrelated OR body:battery AND NOT ext:txt", &["battery.md", "design-notes.md"]),
+            ("(body:unrelated OR body:battery) AND ext:txt", &["archive.txt", "design-notes.txt"]),
+            ("name:design NOT (body:draft OR ext:csv)", &["design-notes.md"]),
+            ("ext:md,txt -ext:.TXT", &["battery.md", "design-notes.md"]),
+            ("NOT ext:md", &["archive.txt", "design-notes.txt"]),
+        ];
+        for (query, expected) in cases {
+            let hits = searcher.search(query, 10)?;
+            let mut names: Vec<_> = hits.iter().map(|hit| {
+                Path::new(&hit.path).file_name().unwrap().to_str().unwrap()
+            }).collect();
+            names.sort_unstable();
+            assert_eq!(names, *expected, "{query}");
+        }
+        let query = "body:battery NOT body:draft ext:md";
+        let hit = searcher.search(query, 10)?.pop().unwrap();
+        let preview = searcher.preview(&hit.path, query)?.unwrap();
+        assert!(preview.highlighted.iter().any(|r| &preview.snippet[r.clone()] == "battery"));
+        assert_eq!(
+            searcher.search("body:battery ext:md", 10)?[0].score,
+            searcher.search("body:battery", 10)?.into_iter()
+                .find(|candidate| candidate.path == hit.path).unwrap().score,
+        );
+        Ok(())
+    }
+
+    #[test]
     fn search_exclusion_via_dash_and_not() -> Result<()> {
         let index_dir = tempfile::tempdir()?;
         let target_dir = tempfile::Builder::new().prefix("dowse-test-").tempdir()?;
@@ -2000,7 +2088,8 @@ mod tests {
         // （128KB），所以扫描窗口内绝不会看到哨兵词。用于验证：
         // 1) 检索命中不受摘要截断影响（截断只影响摘要生成，不影响倒排检索）；
         // 2) 摘要生成因为扫描窗口内没有命中区间而退回无高亮兜底，不 panic。
-        let filler = "填充内容占位符文本。".repeat(20_000);
+        // Stay below the plain-text extraction cap (512 KiB).
+        let filler = "填充内容占位符文本。".repeat(10_000);
         assert!(
             filler.len() > SNIPPET_SCAN_MAX_BYTES,
             "语料要真的超过截断阈值才能验证截断生效"

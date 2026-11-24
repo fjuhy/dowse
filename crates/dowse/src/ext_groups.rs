@@ -5,7 +5,13 @@
 //! schema v3 已经把 kind 字段捎带加上，就是为这天做准备（见 lib.rs 顶部注释）。
 
 /// 文档类：常见办公 / 标记文档格式。
-pub const DOC: &[&str] = &["md", "txt", "pdf", "docx", "xlsx", "pptx", "html"];
+pub const DOC: &[&str] = &[
+    "md", "txt", "pdf", "docx", "docm", "xlsx", "xlsm", "xls", "xlsb", "pptx", "pptm", "html",
+    "htm", "csv", "tsv", "pst", "ost", "msg", "eml",
+];
+
+/// 메일 전용 그룹: 아웃룩 데이터 파일(PST/OST) 및 개별 메일(MSG/EML).
+pub const MAIL: &[&str] = &["pst", "ost", "msg", "eml"];
 
 /// 代码类：参照 extract.rs 的纯文本白名单，挑出偏"编程语言/配置脚本"的那部分
 /// （排掉 txt/md/csv 这类通用文本，它们已经在文档分组里）。
@@ -34,6 +40,7 @@ pub const IMAGE: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp"];
 pub fn by_name(name: Option<&str>) -> Option<&'static [&'static str]> {
     match name {
         Some("doc") => Some(DOC),
+        Some("mail") => Some(MAIL),
         Some("code") => Some(CODE),
         Some("image") => Some(IMAGE),
         _ => None,

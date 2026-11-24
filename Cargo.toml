@@ -7,8 +7,8 @@ members = ["crates/dowse", "crates/dowse-app/src-tauri"]
 [workspace.package]
 edition = "2024"
 rust-version = "1.88"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/ltspace/dowse"
+license = "MIT"
+repository = "https://github.com/fjuhy/dowse"
 authors = ["ltspace"]
 
 [workspace.dependencies]

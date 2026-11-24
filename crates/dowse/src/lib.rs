@@ -75,6 +75,7 @@
 
 mod cursor;
 mod events;
+pub mod export;
 mod ext_groups;
 mod extract;
 mod frn_table;
@@ -85,6 +86,7 @@ mod mft;
 mod ocr;
 mod ocr_queue;
 mod ocr_worker;
+mod pst;
 mod query;
 mod reconcile;
 mod roots;
@@ -314,3 +316,5 @@ mod display_path_tests {
         assert_eq!(display_path(""), "");
     }
 }
+
+pub use volume::use_directory_scans;

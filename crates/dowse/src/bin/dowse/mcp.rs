@@ -39,11 +39,9 @@ const MAX_READ_CHARS: usize = 8_000;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchParams {
-    /// 查询词，支持空格分隔多个词（AND 语义）和 "短语查询"。也支持内联操作符：
-    /// `path:关键词`（按路径匹配）、`author:作者`/`title:标题`（按文档属性）、`mtime:>2026-01-01`/`mtime:<=2026-07`（按修改
-    /// 日期，支持 > >= < <=，日期写 YYYY-MM-DD 或 YYYY-MM）、`size:>10mb`/`size:<500kb`
-    /// （按体积，单位 kb/mb/gb）、`A OR B`（大写 OR 分组，组内空格是 AND）、
-    /// `-词` 或 `NOT 词`（排除）。带空格的操作数加引号，如 `path:"我的 文档"`
+    /// 검색식. `name:` 파일명, `body:` 본문, `ext:pdf,docx` 확장자, `path:` 경로,
+    /// `title:` 제목, `author:` 작성자, `mtime:>=2026-01` 수정일과 `size:<10mb` 크기를 지원합니다.
+    /// 공백은 AND로 처리합니다. 큰따옴표로 구문을 지정하고 괄호와 대문자 AND / OR / NOT으로 조건을 조합합니다.
     pub query: String,
     /// 最多返回几条，默认 10；和 offset 搭配翻页
     #[schemars(range(min = 1, max = MAX_SEARCH_LIMIT))]
@@ -241,7 +239,7 @@ fn to_index_status_output(status: IndexStatus) -> IndexStatusOutput {
             .map(|d| d.as_millis() as i64)
     });
     let reindex_hint = status.korean_dictionary_mismatch().then(|| {
-        "색인을 만들 때와 지금의 한국어 사전(ko-dic) 사용 여부가 다릅니다. 한글 검색을 정확하게 하려면 reindex_roots의 폴더를 다시 색인하세요(`dowse add <폴더>`는 등록된 폴더만 다시 색인하고 다른 폴더는 그대로 둠)."
+        "색인을 만들 때와 지금의 한국어 사전(ko-dic) 사용 여부가 다릅니다. 한글 검색을 정확하게 하려면 reindex_roots의 폴더를 다시 색인하세요(`indexray-cli add <폴더>`는 등록된 폴더만 다시 색인하고 다른 폴더는 그대로 둠)."
             .to_string()
     });
     let reindex_roots = status
@@ -282,7 +280,7 @@ fn index_unavailable_result(err: &anyhow::Error) -> CallToolResult {
     CallToolResult::structured_error(json!({
         "error": "index_unavailable",
         "message": format!("索引不可用：{err}"),
-        "hint": "先用 `dowse index <目录>` 建一次索引",
+        "hint": "先用 `indexray-cli index <目录>` 建一次索引",
     }))
 }
 
@@ -330,7 +328,7 @@ impl DowseMcpServer {
     }
 
     #[tool(
-        description = "在本地全文索引里搜索，返回命中列表；命中词用 «» 标出。查询串支持内联操作符：path:关键词（按路径）、author:作者 / title:标题（按文档属性的作者/标题）、mtime:>2026-01-01 / mtime:<=2026-07（按修改日期，比较符 > >= < <=，日期 YYYY-MM-DD 或 YYYY-MM）、size:>10mb / size:<500kb（按体积，单位 kb/mb/gb）、大写 OR 分组（组内空格为 AND）、-词 或 NOT 词 排除；带空格的操作数加引号如 path:\"我的 文档\"。默认按相关度排序，可用 sort 改按修改时间/体积排；ext 可按扩展名过滤（逗号分隔多个）；limit/offset 翻页，返回里的 total_hits 是匹配总数。先用这个工具定位候选文件，再用 preview 看更长的上下文。",
+        description = "로컬 색인을 검색합니다. 검색식에서 name:, body:, ext:, path:, title:, author:, mtime:, size: 조건을 대문자 AND / OR / NOT 또는 괄호로 조합할 수 있습니다. 기본 정렬은 관련도순입니다. sort로 정렬을 바꾸고 limit과 offset으로 결과를 나눠 읽습니다. total_hits는 전체 결과 수입니다. 더 긴 본문은 preview로 읽습니다.",
         output_schema = schema_for_output::<SearchOutput>(),
         annotations(title = "全文搜索", read_only_hint = true)
     )]
@@ -505,16 +503,15 @@ impl ServerHandler for DowseMcpServer {
     fn get_info(&self) -> InitializeResult {
         InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(
-                Implementation::new("dowse", env!("CARGO_PKG_VERSION"))
-                    .with_title("dowse — Local File Search")
-                    .with_description("Windows 本地文件全文搜索的只读 MCP server")
-                    .with_website_url("https://lter.space/dowse/"),
+                Implementation::new("indexray-cli", "1.1.0")
+                    .with_title("IndexRay")
+                    .with_description("IndexRay 로컬 문서 검색"),
             )
             .with_instructions(
-                "dowse 是本地全文搜索索引的只读接口。先用 search 定位文件；用 preview 查看命中附近上下文，\
+                "IndexRay 是本地全文搜索索引的只读接口。先用 search 定位文件；用 preview 查看命中附近上下文，\
                  需要更多正文时按 next_offset_chars 分页调用 read_file_chunk；也可以先用 index_status 检查索引范围与更新时间。\
                  read_file_chunk 只返回已经入索引的内容，不直接读取任意路径。这里没有修改文件或索引的工具——\
-                 建立/重建索引由用户在 dowse-app 或 `dowse index` CLI 中触发。",
+                 建立/重建索引由用户在 IndexRay 或 `indexray-cli index` CLI 中触发。",
             )
     }
 }
@@ -640,7 +637,7 @@ mod tests {
         let message = structured["message"].as_str().unwrap_or_default();
         let hint = structured["hint"].as_str().unwrap_or_default();
         assert!(
-            hint.contains("dowse index"),
+            hint.contains("indexray-cli index"),
             "hint 字段应带建库指引: {structured:#?}"
         );
         assert!(!message.is_empty());
@@ -676,7 +673,7 @@ mod tests {
         let structured = result.structured_content.expect("应该带结构化错误内容");
         let hint = structured["hint"].as_str().unwrap_or_default();
         assert!(
-            hint.contains("dowse index"),
+            hint.contains("indexray-cli index"),
             "hint 字段应带建库指引: {structured:#?}"
         );
     }
@@ -695,7 +692,7 @@ mod tests {
         let structured = result.structured_content.expect("应该带结构化错误内容");
         let hint = structured["hint"].as_str().unwrap_or_default();
         assert!(
-            hint.contains("dowse index"),
+            hint.contains("indexray-cli index"),
             "hint 字段应带建库指引: {structured:#?}"
         );
     }
