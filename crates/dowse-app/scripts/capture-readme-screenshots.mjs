@@ -14,6 +14,8 @@ const buildDir = join(appDir, 'build');
 const outputDir = resolve(appDir, '..', '..', 'docs', 'screenshots');
 
 const chromeCandidates = [
+	'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+	'/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
 	'/usr/bin/google-chrome',
 	'/usr/bin/chromium',
 	'/usr/bin/chromium-browser',

@@ -1,0 +1,12 @@
+#!/bin/bash
+# Stub llvm-rc for check-only builds: resources only matter when linking, so write empty outputs.
+for a in "$@"; do
+  if [ "$a" = "/?" ]; then echo "OVERVIEW: LLVM Resource Converter (stub, supports /no-preprocess)"; exit 0; fi
+done
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "/fo" ]; then : > "$a"; fi
+  case "$a" in /fo*) [ "${#a}" -gt 3 ] && : > "${a#/fo}";; esac
+  prev="$a"
+done
+exit 0

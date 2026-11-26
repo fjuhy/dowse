@@ -22,3 +22,6 @@
 # Playwright MCP 调试产物
 /.playwright-mcp/
 /dowse-site-full.png
+
+# dev/check.sh results
+/.check/

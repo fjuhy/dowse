@@ -1,0 +1,2 @@
+#!/bin/bash
+exec "$DOWSE_ZIG_PY" -m ziglang lib "$@"

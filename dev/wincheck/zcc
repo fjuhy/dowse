@@ -1,0 +1,13 @@
+#!/bin/bash
+# Check-only C compiler for x86_64-pc-windows-msvc build scripts (zstd-sys etc.): zig compiles with its
+# bundled mingw headers so `cargo clippy --target x86_64-pc-windows-msvc` can run on macOS. Never links.
+args=()
+skip=0
+for a in "$@"; do
+  if [ $skip = 1 ]; then skip=0; continue; fi
+  case "$a" in
+    --target=*|-target) [ "$a" = "-target" ] && skip=1; continue;;
+  esac
+  args+=("$a")
+done
+exec "$DOWSE_ZIG_PY" -m ziglang cc -target x86_64-windows-gnu "${args[@]}"
